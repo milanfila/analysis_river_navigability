@@ -17,6 +17,13 @@ STATIONS = {
 }
 
 
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if raw == "":
+        return float(default)
+    return float(raw)
+
+
 def parse_chmi_dt(series, local_tz: str = LOCAL_TZ) -> pd.DatetimeIndex:
     s = pd.Series(series).astype(str)
     dt = pd.to_datetime(s, utc=True, errors="coerce")
@@ -128,24 +135,24 @@ def read_thresholds() -> Dict[str, float]:
     """
     return {
         # podpůrná minimální hladina v Mostišti
-        "H_min_watch": float(os.getenv("H_MIN_WATCH_CM", "30")),
-        "H_min_alert": float(os.getenv("H_MIN_ALERT_CM", "40")),
+        "H_min_watch": env_float("H_MIN_WATCH_CM", 30),
+        "H_min_alert": env_float("H_MIN_ALERT_CM", 40),
 
         # hlavní trigger: růst za 1 h
-        "dH_watch": float(os.getenv("DH_WATCH_1H_CM", "3")),
-        "dH_alert": float(os.getenv("DH_ALERT_1H_CM", "6")),
+        "dH_watch": env_float("DH_WATCH_1H_CM", 3),
+        "dH_alert": env_float("DH_ALERT_1H_CM", 6),
 
         # stabilita růstu
-        "rolling_watch": float(os.getenv("ROLLING_WATCH_3H_CM", "1.5")),
-        "rolling_alert": float(os.getenv("ROLLING_ALERT_3H_CM", "2.5")),
+        "rolling_watch": env_float("ROLLING_WATCH_3H_CM", 1.5),
+        "rolling_alert": env_float("ROLLING_ALERT_3H_CM", 2.5),
 
         # doplňkový průtok pod hrází
-        "Q_watch": float(os.getenv("Q_WATCH_M3S", "0.8")),
-        "Q_alert": float(os.getenv("Q_ALERT_M3S", "1.2")),
+        "Q_watch": env_float("Q_WATCH_M3S", 0.8),
+        "Q_alert": env_float("Q_ALERT_M3S", 1.2),
 
         # orientační ETA vlny do Nesměře
-        "ETA_MIN_H": float(os.getenv("ETA_MIN_H", "1.0")),
-        "ETA_MAX_H": float(os.getenv("ETA_MAX_H", "2.0")),
+        "ETA_MIN_H": env_float("ETA_MIN_H", 1.0),
+        "ETA_MAX_H": env_float("ETA_MAX_H", 2.0),
     }
 
 
