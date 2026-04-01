@@ -5,10 +5,6 @@ on:
   schedule:
     - cron: "0 */3 * * *"
 
-concurrency:
-  group: oslava-alert
-  cancel-in-progress: true
-
 jobs:
   run-alert:
     runs-on: ubuntu-latest
@@ -25,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pandas requests
 
       - name: Run alert script
         env:
@@ -48,3 +44,5 @@ jobs:
           ETA_MAX_H: ${{ secrets.ETA_MAX_H }}
 
           ALWAYS_EMAIL: ${{ secrets.ALWAYS_EMAIL }}
+
+        run: python alert_oslava.py
