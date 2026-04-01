@@ -121,11 +121,31 @@ def build_live_features() -> pd.DataFrame:
 
 
 def read_thresholds() -> Dict[str, float]:
+    """
+    Kalibrace pro Oslavu pod VD Mostiště:
+    - hlavní signál je růst H pod hrází
+    - absolutní H je jen podpůrná informace
+    """
     return {
-        "H_thr": float(os.getenv("H_THR_CM", "35")),
-        "dH_thr": float(os.getenv("DH_THR_1H_CM", "3")),
-        "rolling_thr": float(os.getenv("ROLLING_DH_3H_CM", "1.5")),
-        "Q_thr": float(os.getenv("Q_THR_M3S", "0.8")),
+        # podpůrná minimální hladina v Mostišti
+        "H_min_watch": float(os.getenv("H_MIN_WATCH_CM", "30")),
+        "H_min_alert": float(os.getenv("H_MIN_ALERT_CM", "40")),
+
+        # hlavní trigger: růst za 1 h
+        "dH_watch": float(os.getenv("DH_WATCH_1H_CM", "3")),
+        "dH_alert": float(os.getenv("DH_ALERT_1H_CM", "6")),
+
+        # stabilita růstu
+        "rolling_watch": float(os.getenv("ROLLING_WATCH_3H_CM", "1.5")),
+        "rolling_alert": float(os.getenv("ROLLING_ALERT_3H_CM", "2.5")),
+
+        # doplňkový průtok pod hrází
+        "Q_watch": float(os.getenv("Q_WATCH_M3S", "0.8")),
+        "Q_alert": float(os.getenv("Q_ALERT_M3S", "1.2")),
+
+        # orientační ETA vlny do Nesměře
+        "ETA_MIN_H": float(os.getenv("ETA_MIN_H", "1.0")),
+        "ETA_MAX_H": float(os.getenv("ETA_MAX_H", "2.0")),
     }
 
 
@@ -138,28 +158,67 @@ def evaluate_alert(live_features: pd.DataFrame, thresholds: Dict[str, float]) ->
     trend3 = float(last["rolling_dH_3h"]) if pd.notna(last.get("rolling_dH_3h")) else float("nan")
     Qm = float(last["Q_mostiste"]) if pd.notna(last.get("Q_mostiste")) else float("nan")
 
-    score = 0
     reasons = []
+    confidence = 0.0
 
-    if H >= thresholds["H_thr"]:
-        score += 1
-        reasons.append(f"H_mostiste {H:.1f} >= {thresholds['H_thr']:.1f} cm")
-    if pd.notna(dH1) and dH1 >= thresholds["dH_thr"]:
-        score += 2
-        reasons.append(f"dH_mostiste_1h {dH1:.1f} >= {thresholds['dH_thr']:.1f} cm")
-    if pd.notna(trend3) and trend3 >= thresholds["rolling_thr"]:
-        score += 1
-        reasons.append(f"rolling_dH_3h {trend3:.1f} >= {thresholds['rolling_thr']:.1f} cm")
-    if pd.notna(Qm) and Qm >= thresholds["Q_thr"]:
-        score += 1
-        reasons.append(f"Q_mostiste {Qm:.3f} >= {thresholds['Q_thr']:.3f} m3/s")
+    # ALERT = jasná manipulační vlna
+    alert_main = pd.notna(dH1) and dH1 >= thresholds["dH_alert"]
+    alert_support = (
+        (H >= thresholds["H_min_alert"]) or
+        (pd.notna(trend3) and trend3 >= thresholds["rolling_alert"]) or
+        (pd.notna(Qm) and Qm >= thresholds["Q_alert"])
+    )
 
-    if score >= 3:
+    # WATCH = slabší, ale zajímavý růst
+    watch_main = pd.notna(dH1) and dH1 >= thresholds["dH_watch"]
+    watch_support = (
+        (H >= thresholds["H_min_watch"]) or
+        (pd.notna(trend3) and trend3 >= thresholds["rolling_watch"]) or
+        (pd.notna(Qm) and Qm >= thresholds["Q_watch"])
+    )
+
+    if alert_main and alert_support:
         decision = "ALERT"
-    elif score >= 2:
+        confidence = 0.85
+
+        reasons.append(f"silný růst hladiny pod hrází: dH_mostiste_1h = {dH1:.1f} cm")
+        if H >= thresholds["H_min_alert"]:
+            reasons.append(f"dostatečná absolutní hladina: H_mostiste = {H:.1f} cm")
+        if pd.notna(trend3) and trend3 >= thresholds["rolling_alert"]:
+            reasons.append(f"stabilní růst: rolling_dH_3h = {trend3:.1f} cm")
+        if pd.notna(Qm) and Qm >= thresholds["Q_alert"]:
+            reasons.append(f"zvýšený průtok pod hrází: Q_mostiste = {Qm:.3f} m3/s")
+
+    elif watch_main or (watch_main and watch_support):
         decision = "WATCH"
+        confidence = 0.55
+
+        reasons.append(f"pozorovaný růst hladiny: dH_mostiste_1h = {dH1:.1f} cm")
+        if H >= thresholds["H_min_watch"]:
+            reasons.append(f"podpůrně i hladina: H_mostiste = {H:.1f} cm")
+        if pd.notna(trend3) and trend3 >= thresholds["rolling_watch"]:
+            reasons.append(f"růst potvrzen trendem: rolling_dH_3h = {trend3:.1f} cm")
+        if pd.notna(Qm) and Qm >= thresholds["Q_watch"]:
+            reasons.append(f"podpůrně i průtok: Q_mostiste = {Qm:.3f} m3/s")
+
     else:
         decision = "NO_ALERT"
+        confidence = 0.05
+        reasons.append("bez významného růstu hladiny pod hrází")
+
+    # orientační interpretace pro Nesměř
+    if decision == "ALERT":
+        interpretation = (
+            f"Pravděpodobná manipulační vlna. "
+            f"Odhad dopadu do Nesměře za cca {thresholds['ETA_MIN_H']:.0f}–{thresholds['ETA_MAX_H']:.0f} h."
+        )
+    elif decision == "WATCH":
+        interpretation = (
+            f"Možný začátek vlny nebo slabší manipulace. "
+            f"Doporučeno dál sledovat Mostiště a Nesměř během následujících {thresholds['ETA_MAX_H']:.0f} h."
+        )
+    else:
+        interpretation = "Aktuálně bez známek významné manipulace nádrže."
 
     return {
         "time": str(last.name),
@@ -168,9 +227,10 @@ def evaluate_alert(live_features: pd.DataFrame, thresholds: Dict[str, float]) ->
         "Q_mostiste": Qm,
         "dH_mostiste_1h": dH1,
         "rolling_dH_3h": trend3,
-        "score": score,
         "decision": decision,
+        "confidence": confidence,
         "reasons": reasons,
+        "interpretation": interpretation,
         "thresholds": thresholds,
     }
 
@@ -205,24 +265,30 @@ def main():
     always_email = os.getenv("ALWAYS_EMAIL", "false").lower() == "true"
 
     if result["decision"] == "ALERT":
-        subject = "Oslava alert – možný růst hladiny"
+        subject = "Oslava ALERT – pravděpodobná manipulační vlna"
     elif result["decision"] == "WATCH":
-        subject = "Oslava watch – sleduj vývoj"
+        subject = "Oslava WATCH – možný růst hladiny"
     else:
-        subject = "Oslava status – bez alertu"
+        subject = "Oslava status – bez významné změny"
 
     reasons_text = "\n- ".join(result["reasons"]) if result["reasons"] else "žádný trigger"
 
     body = f"""Čas: {result['time']}
 
-H_mostiste: {result['H_mostiste']:.1f} cm
-H_nesmer: {result['H_nesmer']:.1f} cm
-Q_mostiste: {result['Q_mostiste']:.3f} m3/s
-dH_mostiste_1h: {result['dH_mostiste_1h']:.1f} cm
-rolling_dH_3h: {result['rolling_dH_3h']:.1f} cm
+Mostiště:
+- H_mostiste: {result['H_mostiste']:.1f} cm
+- Q_mostiste: {result['Q_mostiste']:.3f} m3/s
+- dH_mostiste_1h: {result['dH_mostiste_1h']:.1f} cm
+- rolling_dH_3h: {result['rolling_dH_3h']:.1f} cm
+
+Nesměř:
+- H_nesmer: {result['H_nesmer']:.1f} cm
 
 Decision: {result['decision']}
-Score: {result['score']}
+Confidence: {result['confidence']:.2f}
+
+Interpretace:
+{result['interpretation']}
 
 Důvody:
 - {reasons_text}
