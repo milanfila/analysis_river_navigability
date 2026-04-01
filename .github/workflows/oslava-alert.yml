@@ -35,9 +35,16 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
-          H_THR_CM: ${{ secrets.H_THR_CM }}
-          DH_THR_1H_CM: ${{ secrets.DH_THR_1H_CM }}
-          ROLLING_DH_3H_CM: ${{ secrets.ROLLING_DH_3H_CM }}
-          Q_THR_M3S: ${{ secrets.Q_THR_M3S }}
+
+          H_MIN_WATCH_CM: ${{ secrets.H_MIN_WATCH_CM }}
+          H_MIN_ALERT_CM: ${{ secrets.H_MIN_ALERT_CM }}
+          DH_WATCH_1H_CM: ${{ secrets.DH_WATCH_1H_CM }}
+          DH_ALERT_1H_CM: ${{ secrets.DH_ALERT_1H_CM }}
+          ROLLING_WATCH_3H_CM: ${{ secrets.ROLLING_WATCH_3H_CM }}
+          ROLLING_ALERT_3H_CM: ${{ secrets.ROLLING_ALERT_3H_CM }}
+          Q_WATCH_M3S: ${{ secrets.Q_WATCH_M3S }}
+          Q_ALERT_M3S: ${{ secrets.Q_ALERT_M3S }}
+          ETA_MIN_H: ${{ secrets.ETA_MIN_H }}
+          ETA_MAX_H: ${{ secrets.ETA_MAX_H }}
+
           ALWAYS_EMAIL: ${{ secrets.ALWAYS_EMAIL }}
-        run: python alert_oslava.py
