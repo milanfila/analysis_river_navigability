@@ -8,6 +8,9 @@ from typing import Dict, Optional
 import pandas as pd
 import requests
 
+from pathlib import Path
+import math
+
 LOCAL_TZ = "Europe/Prague"
 BASE_NOW = "https://opendata.chmi.cz/hydrology/now/data"
 
@@ -15,6 +18,33 @@ STATIONS = {
     "mostiste": "0-203-1-471000",
     "nesmer": "0-203-1-473000",
 }
+
+
+
+def load_model(model_path: str = "models/oslava_model_tplus2h.json") -> Dict[str, object]:
+    path = Path(model_path)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def predict_model_proba(last_row: pd.Series, model: Dict[str, object]) -> float:
+    intercept = float(model["intercept"])
+    coeffs = model["coefficients"]
+
+    z = intercept
+    z += float(coeffs["H_mostiste"]) * float(last_row["H_mostiste"])
+    z += float(coeffs["dH_mostiste_1h"]) * float(last_row["dH_mostiste_1h"])
+    z += float(coeffs["rolling_dH_3h"]) * float(last_row["rolling_dH_3h"])
+
+    return sigmoid(z)
+
+
+
+
 
 
 def env_float(name: str, default: float) -> float:
@@ -156,64 +186,76 @@ def read_thresholds() -> Dict[str, float]:
     }
 
 
-def evaluate_alert(live_features: pd.DataFrame, thresholds: Dict[str, float]) -> Dict[str, object]:
-    last = live_features.dropna(subset=["H_mostiste"]).iloc[-1]
+def evaluate_alert(
+    live_features: pd.DataFrame,
+    thresholds: Dict[str, float],
+    model: Optional[Dict[str, object]] = None
+) -> Dict[str, object]:
+    last = live_features.dropna(subset=["H_mostiste", "dH_mostiste_1h", "rolling_dH_3h"]).iloc[-1]
 
     H = float(last["H_mostiste"])
     Hn = float(last["H_nesmer"]) if pd.notna(last.get("H_nesmer")) else float("nan")
-    dH1 = float(last["dH_mostiste_1h"]) if pd.notna(last.get("dH_mostiste_1h")) else float("nan")
-    trend3 = float(last["rolling_dH_3h"]) if pd.notna(last.get("rolling_dH_3h")) else float("nan")
+    dH1 = float(last["dH_mostiste_1h"])
+    trend3 = float(last["rolling_dH_3h"])
     Qm = float(last["Q_mostiste"]) if pd.notna(last.get("Q_mostiste")) else float("nan")
 
+    proba = None
+    if model is not None:
+        proba = float(predict_model_proba(last, model))
+
     reasons = []
-    confidence = 0.0
 
-    # ALERT = jasná manipulační vlna
-    alert_main = pd.notna(dH1) and dH1 >= thresholds["dH_alert"]
-    alert_support = (
-        (H >= thresholds["H_min_alert"]) or
-        (pd.notna(trend3) and trend3 >= thresholds["rolling_alert"]) or
-        (pd.notna(Qm) and Qm >= thresholds["Q_alert"])
-    )
+    # model-based decision
+    if proba is not None:
+        if proba >= 0.75:
+            decision = "ALERT"
+            confidence = proba
+            reasons.append(f"model P(sjízdné za 2h) = {proba:.2f}")
+        elif proba >= 0.45:
+            decision = "WATCH"
+            confidence = proba
+            reasons.append(f"model P(sjízdné za 2h) = {proba:.2f}")
+        else:
+            decision = "NO_ALERT"
+            confidence = proba
+            reasons.append(f"model P(sjízdné za 2h) = {proba:.2f}")
 
-    # WATCH = slabší, ale zajímavý růst
-    watch_main = pd.notna(dH1) and dH1 >= thresholds["dH_watch"]
-    watch_support = (
-        (H >= thresholds["H_min_watch"]) or
-        (pd.notna(trend3) and trend3 >= thresholds["rolling_watch"]) or
-        (pd.notna(Qm) and Qm >= thresholds["Q_watch"])
-    )
-
-    if alert_main and alert_support:
-        decision = "ALERT"
-        confidence = 0.85
-
-        reasons.append(f"silný růst hladiny pod hrází: dH_mostiste_1h = {dH1:.1f} cm")
-        if H >= thresholds["H_min_alert"]:
-            reasons.append(f"dostatečná absolutní hladina: H_mostiste = {H:.1f} cm")
-        if pd.notna(trend3) and trend3 >= thresholds["rolling_alert"]:
-            reasons.append(f"stabilní růst: rolling_dH_3h = {trend3:.1f} cm")
-        if pd.notna(Qm) and Qm >= thresholds["Q_alert"]:
-            reasons.append(f"zvýšený průtok pod hrází: Q_mostiste = {Qm:.3f} m3/s")
-
-    elif watch_main or (watch_main and watch_support):
-        decision = "WATCH"
-        confidence = 0.55
-
-        reasons.append(f"pozorovaný růst hladiny: dH_mostiste_1h = {dH1:.1f} cm")
-        if H >= thresholds["H_min_watch"]:
-            reasons.append(f"podpůrně i hladina: H_mostiste = {H:.1f} cm")
-        if pd.notna(trend3) and trend3 >= thresholds["rolling_watch"]:
-            reasons.append(f"růst potvrzen trendem: rolling_dH_3h = {trend3:.1f} cm")
-        if pd.notna(Qm) and Qm >= thresholds["Q_watch"]:
-            reasons.append(f"podpůrně i průtok: Q_mostiste = {Qm:.3f} m3/s")
+        # hard override při silné manipulaci
+        if dH1 >= thresholds["dH_alert"]:
+            decision = "ALERT"
+            confidence = max(confidence, 0.9)
+            reasons.append(f"hard trigger: dH_mostiste_1h = {dH1:.1f} cm")
+        elif dH1 >= thresholds["dH_watch"] and decision == "NO_ALERT":
+            decision = "WATCH"
+            confidence = max(confidence, 0.5)
+            reasons.append(f"hard watch trigger: dH_mostiste_1h = {dH1:.1f} cm")
 
     else:
-        decision = "NO_ALERT"
-        confidence = 0.05
-        reasons.append("bez významného růstu hladiny pod hrází")
+        # fallback čistě podle thresholdů
+        if dH1 >= thresholds["dH_alert"] and (
+            H >= thresholds["H_min_alert"] or
+            trend3 >= thresholds["rolling_alert"] or
+            (pd.notna(Qm) and Qm >= thresholds["Q_alert"])
+        ):
+            decision = "ALERT"
+            confidence = 0.85
+            reasons.append(f"silný růst hladiny pod hrází: dH_mostiste_1h = {dH1:.1f} cm")
+        elif dH1 >= thresholds["dH_watch"]:
+            decision = "WATCH"
+            confidence = 0.55
+            reasons.append(f"pozorovaný růst hladiny: dH_mostiste_1h = {dH1:.1f} cm")
+        else:
+            decision = "NO_ALERT"
+            confidence = 0.05
+            reasons.append("bez významného růstu hladiny pod hrází")
 
-    # orientační interpretace pro Nesměř
+    if H >= thresholds["H_min_watch"]:
+        reasons.append(f"H_mostiste = {H:.1f} cm")
+    if pd.notna(trend3):
+        reasons.append(f"rolling_dH_3h = {trend3:.1f} cm")
+    if pd.notna(Qm):
+        reasons.append(f"Q_mostiste = {Qm:.3f} m3/s")
+
     if decision == "ALERT":
         interpretation = (
             f"Pravděpodobná manipulační vlna. "
@@ -236,6 +278,7 @@ def evaluate_alert(live_features: pd.DataFrame, thresholds: Dict[str, float]) ->
         "rolling_dH_3h": trend3,
         "decision": decision,
         "confidence": confidence,
+        "proba_tplus_2h": proba,
         "reasons": reasons,
         "interpretation": interpretation,
         "thresholds": thresholds,
@@ -265,7 +308,13 @@ def send_email(subject: str, body: str) -> None:
 def main():
     live_features = build_live_features()
     thresholds = read_thresholds()
-    result = evaluate_alert(live_features, thresholds)
+
+    model = None
+    model_path = os.getenv("MODEL_PATH", "models/oslava_model_tplus2h.json")
+    if Path(model_path).exists():
+        model = load_model(model_path)
+
+    result = evaluate_alert(live_features, thresholds, model=model)
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
@@ -293,6 +342,7 @@ Nesměř:
 
 Decision: {result['decision']}
 Confidence: {result['confidence']:.2f}
+P(sjízdné za 2h): {result['proba_tplus_2h'] if result['proba_tplus_2h'] is not None else 'n/a'}
 
 Interpretace:
 {result['interpretation']}

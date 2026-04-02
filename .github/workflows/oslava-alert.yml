@@ -45,4 +45,6 @@ jobs:
 
           ALWAYS_EMAIL: ${{ secrets.ALWAYS_EMAIL }}
 
+          MODEL_PATH: models/oslava_model_tplus2h.json
+
         run: python alert_oslava.py
