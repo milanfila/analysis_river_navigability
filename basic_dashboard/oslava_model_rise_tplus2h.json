@@ -1,0 +1,26 @@
+{
+  "model_type": "rise_prediction",
+  "horizon_h": 2,
+  "threshold": 0.2,
+  "features": [
+    "dH_mostiste_1h",
+    "dH_mostiste_2h",
+    "rolling_dH_3h"
+  ],
+  "intercept": -2.6867225385924014,
+  "coefficients": {
+    "dH_mostiste_1h": -0.1736238675221111,
+    "dH_mostiste_2h": -0.28950152928725087,
+    "rolling_dH_3h": 1.6509454234343164
+  },
+  "scaler_mean": {
+    "dH_mostiste_1h": -0.0007050473922584863,
+    "dH_mostiste_2h": 0.007669919534326313,
+    "rolling_dH_3h": 0.0073866554606154
+  },
+  "scaler_scale": {
+    "dH_mostiste_1h": 1.043360027630023,
+    "dH_mostiste_2h": 1.6714457493013328,
+    "rolling_dH_3h": 0.6947355886015212
+  }
+}

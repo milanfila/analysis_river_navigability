@@ -27,8 +27,10 @@ DEFAULT_MODEL = {
 }
 
 DEFAULT_MODEL_PATHS = [
-    Path("models/oslava_model_tplus2h.json"),
+    Path("oslava_model_rise_tplus2h.json"),
+    Path("models/oslava_model_rise_tplus2h.json"),
     Path("oslava_model_tplus2h.json"),
+    Path("models/oslava_model_tplus2h.json"),
 ]
 
 
@@ -41,17 +43,10 @@ def load_model_json(path: Path) -> dict:
         raise ValueError(f"Model JSON {path} nemá požadované klíče: {required_top}")
 
     coeffs = model["coefficients"]
-    required_coeffs = {"H_mostiste", "dH_mostiste_1h", "rolling_dH_3h"}
-    if not required_coeffs.issubset(coeffs.keys()):
-        raise ValueError(f"Model JSON {path} nemá požadované koeficienty: {required_coeffs}")
-
     return {
+        **model,
         "intercept": float(model["intercept"]),
-        "coefficients": {
-            "H_mostiste": float(coeffs["H_mostiste"]),
-            "dH_mostiste_1h": float(coeffs["dH_mostiste_1h"]),
-            "rolling_dH_3h": float(coeffs["rolling_dH_3h"]),
-        },
+        "coefficients": {k: float(v) for k, v in coeffs.items()},
         "source": str(path),
     }
 
@@ -63,7 +58,7 @@ def find_model_file() -> Path | None:
     return None
 
 
-def parse_chmi_dt(series, local_tz: str = LOCAL_TZ) -> pd.DatetimeIndex:
+def parse_chmi_dt(series, local_tz: str = LOCAL_TZ):
     dt = pd.to_datetime(pd.Series(series).astype(str), utc=True, errors="coerce")
     return pd.DatetimeIndex(dt).tz_convert(local_tz)
 
@@ -158,7 +153,9 @@ def build_live_features() -> pd.DataFrame:
     out["Q_mostiste"] = pd.to_numeric(out.get("Q_mostiste_live"), errors="coerce")
     out["Q_nesmer"] = pd.to_numeric(out.get("Q_nesmer_live"), errors="coerce")
 
+    # data jsou po 10 minutách
     out["dH_mostiste_1h"] = out["H_mostiste"] - out["H_mostiste"].shift(6)
+    out["dH_mostiste_2h"] = out["H_mostiste"] - out["H_mostiste"].shift(12)
     out["rolling_dH_3h"] = out["dH_mostiste_1h"].rolling(18, min_periods=6).mean()
     return out
 
@@ -169,41 +166,82 @@ def sigmoid(x: float) -> float:
 
 def predict_proba(last_row: pd.Series, model: dict) -> float:
     z = float(model["intercept"])
-    z += float(model["coefficients"]["H_mostiste"]) * float(last_row["H_mostiste"])
-    z += float(model["coefficients"]["dH_mostiste_1h"]) * float(last_row["dH_mostiste_1h"])
-    z += float(model["coefficients"]["rolling_dH_3h"]) * float(last_row["rolling_dH_3h"])
+
+    if "features" in model and "scaler_mean" in model and "scaler_scale" in model:
+        for f in model["features"]:
+            x = float(last_row[f])
+            mean = float(model["scaler_mean"][f])
+            scale = float(model["scaler_scale"][f])
+            x_std = (x - mean) / scale if scale != 0 else 0.0
+            coef = float(model["coefficients"][f])
+            z += coef * x_std
+    else:
+        for f, coef in model["coefficients"].items():
+            if f in last_row.index and pd.notna(last_row[f]):
+                z += float(coef) * float(last_row[f])
+
     return sigmoid(z)
 
 
 def evaluate_nowcast(df: pd.DataFrame, model: dict) -> dict:
-    last = df.dropna(subset=["H_mostiste", "dH_mostiste_1h", "rolling_dH_3h"]).iloc[-1]
+    if "features" in model:
+        required = list(set(["H_mostiste", "H_nesmer", "Q_mostiste"] + model["features"]))
+    else:
+        required = ["H_mostiste", "H_nesmer", "Q_mostiste", "dH_mostiste_1h", "rolling_dH_3h"]
+
+    last = df.dropna(subset=required).iloc[-1]
     proba = predict_proba(last, model)
 
-    if proba >= 0.75:
-        decision = "🟢 JEĎ"
-        explanation = "Pravděpodobná manipulační vlna."
-    elif proba >= 0.45:
-        decision = "🟡 SLEDUJ"
-        explanation = "Možný začátek vlny nebo slabší manipulace."
+    if model.get("model_type") == "rise_prediction":
+        threshold = float(model.get("threshold", 0.2))
+        if proba < threshold:
+            decision = "🟢 KLID"
+            explanation = "Bez známek významného vzestupu hladiny v Nesměři během následujících 2 hodin."
+        elif proba < 0.5:
+            decision = "🟡 VLNA MOŽNÁ"
+            explanation = "Možný náběh vlny v Nesměři během následujících 2 hodin."
+        else:
+            decision = "🔴 VLNA PRAVDĚPODOBNÁ"
+            explanation = "Model indikuje pravděpodobný vzestup hladiny v Nesměři během následujících 2 hodin."
+        metric_label = "P(vzestup hladiny za 2 h)"
     else:
-        decision = "🔴 NEJEĎ"
-        explanation = "Bez známek významné manipulace nádrže."
+        if proba >= 0.75:
+            decision = "🟢 JEĎ"
+            explanation = "Pravděpodobná manipulační vlna."
+        elif proba >= 0.45:
+            decision = "🟡 SLEDUJ"
+            explanation = "Možný začátek vlny nebo slabší manipulace."
+        else:
+            decision = "🔴 NEJEĎ"
+            explanation = "Bez známek významné manipulace nádrže."
+        metric_label = "P(sjízdné za 2 h)"
+
+    if pd.notna(last.get("rolling_dH_3h")) and float(last["rolling_dH_3h"]) > 2:
+        hydro_note = "Stabilní růst hladiny na Mostišti."
+    elif pd.notna(last.get("dH_mostiste_1h")) and float(last["dH_mostiste_1h"]) > 3:
+        hydro_note = "Rychlá manipulace nádrže."
+    else:
+        hydro_note = "Bez výrazné změny odtoku."
 
     return {
         "time": last.name,
         "H_mostiste": float(last["H_mostiste"]),
         "H_nesmer": float(last["H_nesmer"]) if pd.notna(last.get("H_nesmer")) else float("nan"),
         "Q_mostiste": float(last["Q_mostiste"]) if pd.notna(last.get("Q_mostiste")) else float("nan"),
-        "dH_mostiste_1h": float(last["dH_mostiste_1h"]),
-        "rolling_dH_3h": float(last["rolling_dH_3h"]),
+        "dH_mostiste_1h": float(last["dH_mostiste_1h"]) if pd.notna(last.get("dH_mostiste_1h")) else float("nan"),
+        "dH_mostiste_2h": float(last["dH_mostiste_2h"]) if pd.notna(last.get("dH_mostiste_2h")) else float("nan"),
+        "rolling_dH_3h": float(last["rolling_dH_3h"]) if pd.notna(last.get("rolling_dH_3h")) else float("nan"),
         "proba_tplus_2h": float(proba),
         "decision": decision,
         "explanation": explanation,
+        "hydro_note": hydro_note,
+        "metric_label": metric_label,
+        "model_type": model.get("model_type", "legacy"),
     }
 
 
 st.title("🚣 Oslava kajak dashboard")
-st.caption("Minimalistická live verze: Mostiště → Nesměř, nowcast sjízdnosti za cca 2 hodiny.")
+st.caption("Minimalistická live verze: Mostiště → Nesměř. Dashboard umí nowcast sjízdnosti i predikci vzestupu hladiny za cca 2 hodiny.")
 
 with st.sidebar:
     st.header("Model")
@@ -218,52 +256,48 @@ with st.sidebar:
 
     model_path_text = st.text_input(
         "Cesta k modelu JSON",
-        value=str(detected_model_path) if detected_model_path is not None else "models/oslava_model_tplus2h.json",
+        value=str(detected_model_path) if detected_model_path is not None else "oslava_model_rise_tplus2h.json",
     )
 
-    model_load_error = None
     loaded_model = None
-
     if use_json_model:
         try:
             loaded_model = load_model_json(Path(model_path_text))
             st.success(f"Načten JSON model: {loaded_model['source']}")
         except Exception as e:
-            model_load_error = str(e)
             st.error(f"JSON model se nepodařilo načíst: {e}")
 
     manual_default = loaded_model if loaded_model is not None else DEFAULT_MODEL
 
     intercept = st.number_input("Intercept", value=float(manual_default["intercept"]), step=0.1)
-    coef_H = st.number_input("Coef H_mostiste", value=float(manual_default["coefficients"]["H_mostiste"]), step=0.01)
-    coef_dH = st.number_input("Coef dH_mostiste_1h", value=float(manual_default["coefficients"]["dH_mostiste_1h"]), step=0.01)
-    coef_roll = st.number_input("Coef rolling_dH_3h", value=float(manual_default["coefficients"]["rolling_dH_3h"]), step=0.01)
+    coeff_keys = list(manual_default["coefficients"].keys())
+    coef_inputs = {}
+    for key in coeff_keys:
+        coef_inputs[key] = st.number_input(f"Coef {key}", value=float(manual_default["coefficients"][key]), step=0.01)
 
     if loaded_model is None:
         st.info("Když JSON model není načtený, dashboard používá ručně zadané koeficienty.")
 
 model = {
+    **(loaded_model if loaded_model is not None else {}),
     "intercept": intercept,
-    "coefficients": {
-        "H_mostiste": coef_H,
-        "dH_mostiste_1h": coef_dH,
-        "rolling_dH_3h": coef_roll,
-    },
+    "coefficients": coef_inputs,
 }
 
 try:
     live_features = build_live_features()
     result = evaluate_nowcast(live_features, model)
 
-    c1, c2, c3 = st.columns([1.4, 1, 1])
+    c1, c2, c3 = st.columns([1.5, 1, 1])
     with c1:
         st.subheader(result["decision"])
         st.write(result["explanation"])
+        st.write(result["hydro_note"])
         st.write(f"**Poslední update:** {result['time']}")
         model_source = model_path_text if use_json_model else "ruční koeficienty"
         st.write(f"**Model:** {model_source}")
     with c2:
-        st.metric("P(sjízdné za 2 h)", f"{100*result['proba_tplus_2h']:.1f} %")
+        st.metric(result["metric_label"], f"{100*result['proba_tplus_2h']:.1f} %")
         st.metric("H Mostiště", f"{result['H_mostiste']:.1f} cm")
     with c3:
         st.metric("dH Mostiště / 1 h", f"{result['dH_mostiste_1h']:.1f} cm")
@@ -278,22 +312,19 @@ try:
     cutoff = live_features.index.max() - pd.Timedelta("48h")
 
     st.subheader("Posledních 48 hodin")
-    recent = live_features.loc[
-        live_features.index >= cutoff,
-        ["H_mostiste", "H_nesmer"]
-    ]
+    recent = live_features.loc[live_features.index >= cutoff, ["H_mostiste", "H_nesmer"]]
     st.line_chart(recent)
 
     st.subheader("Trend pod hrází")
     recent_dh = live_features.loc[
         live_features.index >= cutoff,
-        ["dH_mostiste_1h", "rolling_dH_3h"]
+        ["dH_mostiste_1h", "dH_mostiste_2h", "rolling_dH_3h"]
     ]
     st.line_chart(recent_dh)
 
     with st.expander("Poslední řádky dat"):
         st.dataframe(
-            live_features[["H_mostiste", "Q_mostiste", "dH_mostiste_1h", "rolling_dH_3h", "H_nesmer"]].tail(20),
+            live_features[["H_mostiste", "Q_mostiste", "dH_mostiste_1h", "dH_mostiste_2h", "rolling_dH_3h", "H_nesmer"]].tail(20),
             width="stretch",
         )
 
