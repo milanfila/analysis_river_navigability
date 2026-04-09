@@ -202,18 +202,30 @@ try:
 
     st.divider()
 
+    if st.button("🔄 Obnovit data"):
+        st.cache_data.clear()
+        st.rerun()
+
+    cutoff = live_features.index.max() - pd.Timedelta("48h")
+
     st.subheader("Posledních 48 hodin")
-    recent = live_features[["H_mostiste", "H_nesmer"]].last("48h")
+    recent = live_features.loc[
+        live_features.index >= cutoff,
+        ["H_mostiste", "H_nesmer"]
+    ]
     st.line_chart(recent)
 
     st.subheader("Trend pod hrází")
-    recent_dh = live_features[["dH_mostiste_1h", "rolling_dH_3h"]].last("48h")
+    recent_dh = live_features.loc[
+        live_features.index >= cutoff,
+        ["dH_mostiste_1h", "rolling_dH_3h"]
+    ]
     st.line_chart(recent_dh)
 
     with st.expander("Poslední řádky dat"):
         st.dataframe(
             live_features[["H_mostiste", "Q_mostiste", "dH_mostiste_1h", "rolling_dH_3h", "H_nesmer"]].tail(20),
-            use_container_width=True,
+            width="stretch",
         )
 
 except Exception as e:
