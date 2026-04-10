@@ -7,121 +7,134 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 import streamlit as st
-from matplotlib.lines import Line2D
 
-st.set_page_config(page_title="Oslava kajak dashboard", page_icon="🚣", layout="wide")
+st.set_page_config(page_title="Hydro multiprofile dashboard", page_icon="🌊", layout="wide")
 
 LOCAL_TZ = "Europe/Prague"
 BASE_NOW = "https://opendata.chmi.cz/hydrology/now/data"
+META_URL = "https://opendata.chmi.cz/hydrology/historical/metadata/meta1.json"
 
-STATIONS = {
-    "mostiste": "0-203-1-471000",
-    "nesmer": "0-203-1-473000",
-}
-
-DEFAULT_MODEL = {
-    "intercept": -8.0,
-    "coefficients": {
-        "H_mostiste": 0.08,
-        "dH_mostiste_1h": 0.85,
-        "rolling_dH_3h": 0.35,
-    },
-}
+# fallback na lokální metadata
+LOCAL_META_PATHS = [
+    Path("hydro_meta1.json"),
+    Path("../hydro_meta1.json"),
+]
 
 DEFAULT_MODEL_PATHS = [
     Path("oslava_model_rise_tplus2h.json"),
     Path("models/oslava_model_rise_tplus2h.json"),
     Path("basic_dashboard/oslava_model_rise_tplus2h.json"),
-    Path("oslava_model_tplus2h.json"),
-    Path("models/oslava_model_tplus2h.json"),
-]
-
-STATE_PATHS = [
-    Path("alert_state.json"),
-    Path("../alert_state.json"),
-]
-
-HISTORY_PATHS = [
-    Path("alert_history.csv"),
-    Path("../alert_history.csv"),
 ]
 
 
-def load_model_json(path: Path) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        model = json.load(f)
+# =========================================================
+# METADATA STANIC
+# =========================================================
+def _parse_meta_json(obj: dict) -> pd.DataFrame:
+    data_block = obj.get("data", {}).get("data", {})
+    header = data_block.get("header")
+    values = data_block.get("values", [])
 
-    required_top = {"intercept", "coefficients"}
-    if not required_top.issubset(model.keys()):
-        raise ValueError(f"Model JSON {path} nemá požadované klíče: {required_top}")
+    if not header or not values:
+        raise ValueError("Metadata JSON neobsahuje očekávané header/values.")
 
-    coeffs = model["coefficients"]
-    return {
-        **model,
-        "intercept": float(model["intercept"]),
-        "coefficients": {k: float(v) for k, v in coeffs.items()},
-        "source": str(path),
+    cols = [c.strip() for c in header.split(",")]
+    df = pd.DataFrame(values, columns=cols)
+
+    rename_map = {
+        "objID": "station_id",
+        "DBC": "station_code",
+        "STATION_NAME": "station_name",
+        "STREAM_NAME": "stream_name",
+        "GEOGR1": "lat",
+        "GEOGR2": "lon",
+        "SPA_TYP": "spa_type",
+        "SPAH_DS": "stage_desc",
+        "SPAH_UNIT": "stage_unit",
+        "DRYH": "dry_h",
+        "SPA1H": "spa1_h",
+        "SPA2H": "spa2_h",
+        "SPA3H": "spa3_h",
+        "SPA4H": "spa4_h",
+        "SPAQ_DS": "flow_desc",
+        "SPAQ_UNIT": "flow_unit",
+        "DRYQ": "dry_q",
+        "SPA1Q": "spa1_q",
+        "SPA2Q": "spa2_q",
+        "SPA3Q": "spa3_q",
+        "SPA4Q": "spa4_q",
+        "PLO_STA": "catchment_area_km2",
+        "HLGP4": "basin_code",
     }
+    df = df.rename(columns=rename_map)
+
+    num_cols = [
+        "lat", "lon",
+        "dry_h", "spa1_h", "spa2_h", "spa3_h", "spa4_h",
+        "dry_q", "spa1_q", "spa2_q", "spa3_q", "spa4_q",
+        "catchment_area_km2",
+    ]
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    for c in [
+        "station_id", "station_code", "station_name", "stream_name",
+        "spa_type", "stage_unit", "flow_unit", "basin_code"
+    ]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+
+    df["label"] = (
+        df["stream_name"].fillna("") + " | "
+        + df["station_name"].fillna("") + " | "
+        + df["station_id"].fillna("")
+    )
+    return df
 
 
-def find_model_file() -> Path | None:
-    for path in DEFAULT_MODEL_PATHS:
-        if path.exists():
-            return path
+def _find_local_meta_path() -> Optional[Path]:
+    for p in LOCAL_META_PATHS:
+        if p.exists():
+            return p
     return None
 
 
-def find_state_file() -> Path | None:
-    for path in STATE_PATHS:
-        if path.exists():
-            return path
-    return None
+def load_station_catalog(meta_url: str = META_URL, timeout: int = 30) -> tuple[pd.DataFrame, str]:
+    try:
+        r = requests.get(meta_url, timeout=timeout)
+        r.raise_for_status()
+        obj = r.json()
+        return _parse_meta_json(obj), "web"
+    except Exception:
+        local_path = _find_local_meta_path()
+        if local_path is None:
+            raise FileNotFoundError("Nepodařilo se načíst metadata z webu a lokální hydro_meta1.json nebyl nalezen.")
+        with open(local_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return _parse_meta_json(obj), f"local ({local_path})"
 
 
-def find_history_file() -> Path | None:
-    for path in HISTORY_PATHS:
-        if path.exists():
-            return path
-    return None
+def prepare_station_options(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out = out.dropna(subset=["station_id", "stream_name", "station_name"]).copy()
+    out = out[out["station_id"].astype(str).str.len() > 0].copy()
+    out = out[out["stream_name"].astype(str).str.len() > 0].copy()
+    out = out[out["station_name"].astype(str).str.len() > 0].copy()
+    out = out.sort_values(["stream_name", "station_name", "station_id"]).reset_index(drop=True)
+    return out
 
 
-def load_alert_state() -> dict:
-    state_path = find_state_file()
-    if state_path is None:
-        return {
-            "last_alert_level": "NO_ALERT",
-            "last_sent_at": None,
-            "last_proba": 0.0,
-            "state_source": None,
-        }
-
-    with open(state_path, "r", encoding="utf-8") as f:
-        state = json.load(f)
-
-    state["state_source"] = str(state_path)
-    return state
+@st.cache_data(ttl=24 * 3600)
+def get_station_catalog():
+    df_meta, source = load_station_catalog()
+    df_meta = prepare_station_options(df_meta)
+    return df_meta, source
 
 
-def load_alert_history() -> pd.DataFrame:
-    history_path = find_history_file()
-    if history_path is None:
-        return pd.DataFrame(
-            columns=[
-                "time", "alert_level", "kayak_decision", "eta", "proba",
-                "H_mostiste", "H_nesmer",
-                "dH_mostiste_1h", "dH_mostiste_2h", "rolling_dH_3h",
-                "email_sent", "anti_spam_reason"
-            ]
-        )
-
-    df_hist = pd.read_csv(history_path)
-    if "time" in df_hist.columns:
-        df_hist["time"] = pd.to_datetime(df_hist["time"], errors="coerce")
-        df_hist = df_hist.sort_values("time")
-
-    return df_hist
-
-
+# =========================================================
+# LIVE DATA
+# =========================================================
 def parse_chmi_dt(series, local_tz: str = LOCAL_TZ):
     dt = pd.to_datetime(pd.Series(series).astype(str), utc=True, errors="coerce")
     return pd.DatetimeIndex(dt).tz_convert(local_tz)
@@ -200,27 +213,53 @@ def fetch_station_now(station_id: str) -> pd.DataFrame:
     return df_live
 
 
-@st.cache_data(ttl=300)
-def build_live_features() -> pd.DataFrame:
-    live_most = fetch_station_now(STATIONS["mostiste"]).rename(
-        columns={"H_live": "H_mostiste_live", "Q_live": "Q_mostiste_live"}
-    )
-    live_nesm = fetch_station_now(STATIONS["nesmer"]).rename(
-        columns={"H_live": "H_nesmer_live", "Q_live": "Q_nesmer_live"}
-    )
-
-    live_df = live_most.join(live_nesm, how="outer", lsuffix="_most", rsuffix="_nesm").sort_index()
-
-    out = live_df.copy()
-    out["H_mostiste"] = pd.to_numeric(out["H_mostiste_live"], errors="coerce")
-    out["H_nesmer"] = pd.to_numeric(out["H_nesmer_live"], errors="coerce")
-    out["Q_mostiste"] = pd.to_numeric(out.get("Q_mostiste_live"), errors="coerce")
-    out["Q_nesmer"] = pd.to_numeric(out.get("Q_nesmer_live"), errors="coerce")
-
-    out["dH_mostiste_1h"] = out["H_mostiste"] - out["H_mostiste"].shift(6)
-    out["dH_mostiste_2h"] = out["H_mostiste"] - out["H_mostiste"].shift(12)
-    out["rolling_dH_3h"] = out["dH_mostiste_1h"].rolling(18, min_periods=6).mean()
+def build_single_station_features(df_live: pd.DataFrame) -> pd.DataFrame:
+    out = df_live.copy()
+    out["H"] = pd.to_numeric(out.get("H_live"), errors="coerce")
+    out["Q"] = pd.to_numeric(out.get("Q_live"), errors="coerce")
+    out["dH_1h"] = out["H"] - out["H"].shift(6)
+    out["dH_2h"] = out["H"] - out["H"].shift(12)
+    out["rolling_dH_3h"] = out["dH_1h"].rolling(18, min_periods=6).mean()
     return out
+
+
+def build_dual_station_features(df1: pd.DataFrame, df2: pd.DataFrame, label1: str, label2: str) -> pd.DataFrame:
+    left = df1.rename(columns={"H_live": f"H_{label1}", "Q_live": f"Q_{label1}"})
+    right = df2.rename(columns={"H_live": f"H_{label2}", "Q_live": f"Q_{label2}"})
+    df = left.join(right, how="outer").sort_index()
+
+    df[f"H_{label1}"] = pd.to_numeric(df[f"H_{label1}"], errors="coerce")
+    df[f"H_{label2}"] = pd.to_numeric(df[f"H_{label2}"], errors="coerce")
+    df[f"Q_{label1}"] = pd.to_numeric(df.get(f"Q_{label1}"), errors="coerce")
+    df[f"Q_{label2}"] = pd.to_numeric(df.get(f"Q_{label2}"), errors="coerce")
+
+    df[f"dH_{label1}_1h"] = df[f"H_{label1}"] - df[f"H_{label1}"].shift(6)
+    df[f"dH_{label2}_1h"] = df[f"H_{label2}"] - df[f"H_{label2}"].shift(6)
+    df["delta_H_2minus1"] = df[f"H_{label2}"] - df[f"H_{label1}"]
+    return df
+
+
+# =========================================================
+# MODEL PRO OSLAVU
+# =========================================================
+def find_default_model_file() -> Optional[Path]:
+    for path in DEFAULT_MODEL_PATHS:
+        if path.exists():
+            return path
+    return None
+
+
+def load_model_json(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        model = json.load(f)
+
+    coeffs = model["coefficients"]
+    return {
+        **model,
+        "intercept": float(model["intercept"]),
+        "coefficients": {k: float(v) for k, v in coeffs.items()},
+        "source": str(path),
+    }
 
 
 def sigmoid(x: float) -> float:
@@ -246,350 +285,246 @@ def predict_proba(last_row: pd.Series, model: dict) -> float:
     return sigmoid(z)
 
 
-def kayak_decision_layer(result: dict) -> dict:
-    Hn = result["H_nesmer"]
-    proba = result["proba_tplus_2h"]
-
+def kayak_decision_layer(H_nesmer: float, proba: float) -> dict:
     H_GO = 100.0
     H_MAYBE = 90.0
 
-    if pd.notna(Hn) and Hn >= H_GO:
-        return {
-            "kayak_decision": "✅ JEĎ",
-            "kayak_reason": "Nesměř je aktuálně na sjízdné hladině.",
-            "eta": "teď",
-        }
-
-    if pd.notna(Hn) and H_MAYBE <= Hn < H_GO:
+    if pd.notna(H_nesmer) and H_nesmer >= H_GO:
+        return {"decision": "✅ JEĎ", "reason": "Nesměř je aktuálně na sjízdné hladině.", "eta": "teď"}
+    if pd.notna(H_nesmer) and H_MAYBE <= H_nesmer < H_GO:
         if proba >= 0.50:
-            return {
-                "kayak_decision": "⏳ ZA CHVÍLI",
-                "kayak_reason": "Nesměř je hraniční a model čeká další vzestup.",
-                "eta": "1–2 h",
-            }
-        return {
-            "kayak_decision": "🟡 SLEDUJ",
-            "kayak_reason": "Nesměř je hraniční, ale model zatím nevidí silný náběh vlny.",
-            "eta": "nejisté",
-        }
-
+            return {"decision": "⏳ ZA CHVÍLI", "reason": "Nesměř je hraniční a model čeká další vzestup.", "eta": "1–2 h"}
+        return {"decision": "🟡 SLEDUJ", "reason": "Nesměř je hraniční, ale model zatím nevidí silný náběh vlny.", "eta": "nejisté"}
     if proba >= 0.50:
-        return {
-            "kayak_decision": "⏳ ZA CHVÍLI",
-            "kayak_reason": "Teď to ještě nevypadá sjízdně, ale model indikuje pravděpodobný náběh vlny.",
-            "eta": "1–2 h",
-        }
+        return {"decision": "⏳ ZA CHVÍLI", "reason": "Teď to ještě nevypadá sjízdně, ale model indikuje pravděpodobný náběh vlny.", "eta": "1–2 h"}
     if proba >= 0.20:
-        return {
-            "kayak_decision": "🟡 SLEDUJ",
-            "kayak_reason": "Zatím nesjízdné, ale možný slabší nebo nejistý náběh vlny.",
-            "eta": "2–3 h / nejisté",
-        }
-    return {
-        "kayak_decision": "❌ NEJEĎ",
-        "kayak_reason": "Nesměř je nízko a model neukazuje významnou vlnu.",
-        "eta": "-",
-    }
+        return {"decision": "🟡 SLEDUJ", "reason": "Zatím nesjízdné, ale možný slabší nebo nejistý náběh vlny.", "eta": "2–3 h / nejisté"}
+    return {"decision": "❌ NEJEĎ", "reason": "Nesměř je nízko a model neukazuje významnou vlnu.", "eta": "-"}
 
 
-def evaluate_nowcast(df: pd.DataFrame, model: dict) -> dict:
-    if "features" in model:
-        required = list(set(["H_mostiste", "H_nesmer", "Q_mostiste"] + model["features"]))
-    else:
-        required = ["H_mostiste", "H_nesmer", "Q_mostiste", "dH_mostiste_1h", "rolling_dH_3h"]
+def evaluate_oslava_nowcast(df_dual: pd.DataFrame, model: dict) -> dict:
+    # mapování do původních názvů features pro Mostiště/Nesměř
+    df = pd.DataFrame(index=df_dual.index)
+    df["H_mostiste"] = df_dual["H_upstream"]
+    df["H_nesmer"] = df_dual["H_downstream"]
+    df["Q_mostiste"] = df_dual.get("Q_upstream")
+    df["dH_mostiste_1h"] = df["H_mostiste"] - df["H_mostiste"].shift(6)
+    df["dH_mostiste_2h"] = df["H_mostiste"] - df["H_mostiste"].shift(12)
+    df["rolling_dH_3h"] = df["dH_mostiste_1h"].rolling(18, min_periods=6).mean()
 
+    required = list(set(["H_mostiste", "H_nesmer", "Q_mostiste"] + model.get("features", [])))
     last = df.dropna(subset=required).iloc[-1]
+
     proba = predict_proba(last, model)
-
-    if model.get("model_type") == "rise_prediction":
-        threshold = float(model.get("threshold", 0.2))
-        if proba < threshold:
-            decision = "🟢 KLID"
-            explanation = "Bez známek významného vzestupu hladiny v Nesměři během následujících 2 hodin."
-        elif proba < 0.5:
-            decision = "🟡 VLNA MOŽNÁ"
-            explanation = "Možný náběh vlny v Nesměři během následujících 2 hodin."
-        else:
-            decision = "🔴 VLNA PRAVDĚPODOBNÁ"
-            explanation = "Model indikuje pravděpodobný vzestup hladiny v Nesměři během následujících 2 hodin."
-        metric_label = "P(vzestup hladiny za 2 h)"
-    else:
-        if proba >= 0.75:
-            decision = "🟢 JEĎ"
-            explanation = "Pravděpodobná manipulační vlna."
-        elif proba >= 0.45:
-            decision = "🟡 SLEDUJ"
-            explanation = "Možný začátek vlny nebo slabší manipulace."
-        else:
-            decision = "🔴 NEJEĎ"
-            explanation = "Bez známek významné manipulace nádrže."
-        metric_label = "P(sjízdné za 2 h)"
-
-    if pd.notna(last.get("rolling_dH_3h")) and float(last["rolling_dH_3h"]) > 2:
-        hydro_note = "Stabilní růst hladiny na Mostišti."
-    elif pd.notna(last.get("dH_mostiste_1h")) and float(last["dH_mostiste_1h"]) > 3:
-        hydro_note = "Rychlá manipulace nádrže."
-    else:
-        hydro_note = "Bez výrazné změny odtoku."
-
-    base_result = {
-        "H_nesmer": float(last["H_nesmer"]) if pd.notna(last.get("H_nesmer")) else float("nan"),
-        "proba_tplus_2h": float(proba),
-    }
-    kayak = kayak_decision_layer(base_result)
+    hydro_state = "🟢 KLID" if proba < 0.2 else ("🟡 VLNA MOŽNÁ" if proba < 0.5 else "🔴 VLNA PRAVDĚPODOBNÁ")
+    kayak = kayak_decision_layer(float(last["H_nesmer"]), proba)
 
     return {
         "time": last.name,
         "H_mostiste": float(last["H_mostiste"]),
-        "H_nesmer": float(last["H_nesmer"]) if pd.notna(last.get("H_nesmer")) else float("nan"),
-        "Q_mostiste": float(last["Q_mostiste"]) if pd.notna(last.get("Q_mostiste")) else float("nan"),
-        "dH_mostiste_1h": float(last["dH_mostiste_1h"]) if pd.notna(last.get("dH_mostiste_1h")) else float("nan"),
-        "dH_mostiste_2h": float(last["dH_mostiste_2h"]) if pd.notna(last.get("dH_mostiste_2h")) else float("nan"),
-        "rolling_dH_3h": float(last["rolling_dH_3h"]) if pd.notna(last.get("rolling_dH_3h")) else float("nan"),
-        "proba_tplus_2h": float(proba),
-        "decision": decision,
-        "explanation": explanation,
-        "hydro_note": hydro_note,
-        "metric_label": metric_label,
-        "model_type": model.get("model_type", "legacy"),
-        "kayak_decision": kayak["kayak_decision"],
-        "kayak_reason": kayak["kayak_reason"],
+        "H_nesmer": float(last["H_nesmer"]),
+        "dH_mostiste_1h": float(last["dH_mostiste_1h"]),
+        "dH_mostiste_2h": float(last["dH_mostiste_2h"]),
+        "rolling_dH_3h": float(last["rolling_dH_3h"]),
+        "proba": float(proba),
+        "hydro_state": hydro_state,
+        "kayak_decision": kayak["decision"],
+        "kayak_reason": kayak["reason"],
         "eta": kayak["eta"],
     }
 
 
-st.title("🚣 Oslava kajak dashboard")
-st.caption("Kajak mode: Mostiště → Nesměř. Dashboard kombinuje aktuální stav v Nesměři, model vzestupu hladiny a historii alertů.")
+# =========================================================
+# ANALYTIKA
+# =========================================================
+def estimate_lag_correlation(df: pd.DataFrame, up_col: str, down_col: str, max_lag_h: int = 6) -> pd.DataFrame:
+    """
+    Jednoduchá lag korelace pro 10min data.
+    max_lag_h=6 znamená test zpoždění 0..6 hodin.
+    """
+    rows = []
+    for lag_steps in range(0, max_lag_h * 6 + 1):
+        corr = df[up_col].corr(df[down_col].shift(-lag_steps))
+        rows.append({
+            "lag_steps_10min": lag_steps,
+            "lag_hours": lag_steps / 6,
+            "corr": corr,
+        })
+    out = pd.DataFrame(rows)
+    return out
+
+
+# =========================================================
+# UI
+# =========================================================
+st.title("🌊 Hydro multiprofile dashboard")
+st.caption("Výběr 1 nebo 2 hlásných profilů z aktuálního katalogu ČHMÚ. Pro Oslavu Mostiště → Nesměř se použije i kajak/model logika.")
+
+df_meta, meta_source = get_station_catalog()
 
 with st.sidebar:
-    st.header("Model")
+    st.header("Výběr profilů")
+    st.caption(f"Katalog stanic: {meta_source}")
 
-    detected_model_path = find_model_file()
-    use_json_model = st.toggle("Použít JSON model", value=detected_model_path is not None)
+    rivers = sorted(df_meta["stream_name"].dropna().unique().tolist())
+    selected_river = st.selectbox("Řeka / tok", rivers)
 
-    if detected_model_path is not None:
-        st.caption(f"Nalezený model: `{detected_model_path}`")
+    river_df = df_meta[df_meta["stream_name"] == selected_river].copy()
+
+    station1_label = st.selectbox("První hlásný profil", river_df["label"].tolist(), index=0)
+    station2_options = ["(jen jeden profil)"] + river_df["label"].tolist()
+    station2_label = st.selectbox("Druhý hlásný profil", station2_options, index=0)
+
+    station1_row = river_df[river_df["label"] == station1_label].iloc[0]
+    station1_id = station1_row["station_id"]
+
+    if station2_label == "(jen jeden profil)":
+        station2_id = None
+        station2_row = None
     else:
-        st.caption("JSON model nebyl automaticky nalezen.")
+        station2_row = river_df[river_df["label"] == station2_label].iloc[0]
+        station2_id = station2_row["station_id"]
 
-    model_path_text = st.text_input(
-        "Cesta k modelu JSON",
-        value=str(detected_model_path) if detected_model_path is not None else "oslava_model_rise_tplus2h.json",
-    )
+    st.divider()
+    st.write("**Profil 1:**", station1_row["station_name"])
+    st.write("**ID 1:**", station1_id)
+    if station2_row is not None:
+        st.write("**Profil 2:**", station2_row["station_name"])
+        st.write("**ID 2:**", station2_id)
 
-    loaded_model = None
-    if use_json_model:
-        try:
-            loaded_model = load_model_json(Path(model_path_text))
-            st.success(f"Načten JSON model: {loaded_model['source']}")
-        except Exception as e:
-            st.error(f"JSON model se nepodařilo načíst: {e}")
-
-    manual_default = loaded_model if loaded_model is not None else DEFAULT_MODEL
-
-    intercept = st.number_input("Intercept", value=float(manual_default["intercept"]), step=0.1)
-    coeff_keys = list(manual_default["coefficients"].keys())
-    coef_inputs = {}
-    for key in coeff_keys:
-        coef_inputs[key] = st.number_input(f"Coef {key}", value=float(manual_default["coefficients"][key]), step=0.01)
-
-    if loaded_model is None:
-        st.info("Když JSON model není načtený, dashboard používá ručně zadané koeficienty.")
-
-model = {
-    **(loaded_model if loaded_model is not None else {}),
-    "intercept": intercept,
-    "coefficients": coef_inputs,
-}
+    auto_refresh = st.toggle("Auto refresh přes cache TTL", value=True)
 
 try:
-    live_features = build_live_features()
-    result = evaluate_nowcast(live_features, model)
-    alert_state = load_alert_state()
-    alert_history = load_alert_history()
+    # -----------------------------------------------------
+    # SINGLE PROFILE
+    # -----------------------------------------------------
+    if station2_id is None:
+        live1 = fetch_station_now(station1_id)
+        feat1 = build_single_station_features(live1)
 
-    c1, c2, c3 = st.columns([1.7, 1, 1])
-    with c1:
-        st.subheader(result["kayak_decision"])
-        st.write(result["kayak_reason"])
-        st.write(f"**ETA:** {result['eta']}")
-        st.write("---")
-        st.write(f"**Hydro stav:** {result['decision']}")
-        st.write(result["explanation"])
-        st.write(result["hydro_note"])
-        st.write(f"**Poslední update:** {result['time']}")
-        model_source = model_path_text if use_json_model else "ruční koeficienty"
-        st.write(f"**Model:** {model_source}")
+        last = feat1.dropna(subset=["H"]).iloc[-1]
 
-    with c2:
-        st.metric(result["metric_label"], f"{100*result['proba_tplus_2h']:.1f} %")
-        st.metric("H Mostiště", f"{result['H_mostiste']:.1f} cm")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.subheader("Single-profile režim")
+            st.write(f"**Stanice:** {station1_row['station_name']}")
+            st.write(f"**Řeka:** {station1_row['stream_name']}")
+            st.write(f"**Poslední update:** {last.name}")
+        with c2:
+            st.metric("H", f"{float(last['H']):.1f} cm")
+            q_val = float(last["Q"]) if pd.notna(last.get("Q")) else None
+            st.metric("Q", f"{q_val:.3f} m³/s" if q_val is not None else "-")
+        with c3:
+            dh1 = float(last["dH_1h"]) if pd.notna(last.get("dH_1h")) else float("nan")
+            roll = float(last["rolling_dH_3h"]) if pd.notna(last.get("rolling_dH_3h")) else float("nan")
+            st.metric("dH / 1 h", f"{dh1:.1f} cm")
+            st.metric("rolling dH / 3 h", f"{roll:.2f} cm")
 
-    with c3:
-        st.metric("dH Mostiště / 1 h", f"{result['dH_mostiste_1h']:.1f} cm")
-        st.metric("H Nesměř", f"{result['H_nesmer']:.1f} cm")
-        st.metric("ETA", result["eta"])
+        cutoff = feat1.index.max() - pd.Timedelta("48h")
+        st.subheader("Posledních 48 hodin")
+        st.line_chart(feat1.loc[feat1.index >= cutoff, ["H"]])
 
-    st.divider()
+        st.subheader("Trend")
+        st.line_chart(feat1.loc[feat1.index >= cutoff, ["dH_1h", "dH_2h", "rolling_dH_3h"]])
 
-    st.subheader("Poslední alert")
-    a1, a2, a3 = st.columns(3)
+        with st.expander("Detail stanice"):
+            show_cols = [c for c in ["H", "Q", "dH_1h", "dH_2h", "rolling_dH_3h"] if c in feat1.columns]
+            st.dataframe(feat1[show_cols].tail(30), width="stretch")
 
-    with a1:
-        st.metric("Last alert level", alert_state.get("last_alert_level", "NO_ALERT"))
-
-    with a2:
-        last_sent_at = alert_state.get("last_sent_at")
-        st.metric("Last email sent", last_sent_at if last_sent_at else "-")
-
-    with a3:
-        last_proba = alert_state.get("last_proba", 0.0)
-        st.metric("Last alert proba", f"{100*float(last_proba):.1f} %")
-
-    with st.expander("Detail alert state"):
-        st.json(alert_state)
-
-    st.divider()
-    st.subheader("Historie alertů")
-
-    if alert_history.empty:
-        st.info("Historie alertů zatím není k dispozici.")
+    # -----------------------------------------------------
+    # DUAL PROFILE
+    # -----------------------------------------------------
     else:
-        hist_recent = alert_history.dropna(subset=["time"]).copy()
+        live1 = fetch_station_now(station1_id)
+        live2 = fetch_station_now(station2_id)
 
-        cutoff_hist = hist_recent["time"].max() - pd.Timedelta("7D")
-        hist_recent = hist_recent.loc[hist_recent["time"] >= cutoff_hist].copy()
+        df_dual = build_dual_station_features(live1, live2, "upstream", "downstream")
+        last_dual = df_dual.dropna(subset=["H_upstream", "H_downstream"]).iloc[-1]
 
-        h1, h2, h3 = st.columns(3)
-        with h1:
-            st.metric("Záznamů (7 dní)", len(hist_recent))
-        with h2:
-            st.metric("Email sent count", int(hist_recent["email_sent"].fillna(0).sum()))
-        with h3:
-            st.metric("ALERT count", int((hist_recent["alert_level"] == "ALERT").sum()))
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.subheader("Dual-profile režim")
+            st.write(f"**Profil 1:** {station1_row['station_name']}")
+            st.write(f"**Profil 2:** {station2_row['station_name']}")
+            st.write(f"**Poslední update:** {last_dual.name}")
+        with c2:
+            st.metric("H profil 1", f"{float(last_dual['H_upstream']):.1f} cm")
+            st.metric("H profil 2", f"{float(last_dual['H_downstream']):.1f} cm")
+        with c3:
+            delta_h = float(last_dual["delta_H_2minus1"]) if pd.notna(last_dual.get("delta_H_2minus1")) else float("nan")
+            st.metric("H2 - H1", f"{delta_h:.1f} cm")
 
-        st.write("### Pravděpodobnost v čase + odeslané emaily")
-        fig, ax = plt.subplots(figsize=(12, 4))
+        # Oslava speciální logika: Mostiště -> Nesměř
+        is_oslava_pair = (
+            station1_id == "0-203-1-471000" and station2_id == "0-203-1-473000"
+        )
 
-        hist_plot = hist_recent.dropna(subset=["time", "proba"]).copy()
-        ax.plot(hist_plot["time"], hist_plot["proba"], label="proba", linewidth=2)
+        if is_oslava_pair:
+            model_path = find_default_model_file()
+            if model_path is not None:
+                try:
+                    model = load_model_json(model_path)
+                    oslava_result = evaluate_oslava_nowcast(df_dual, model)
 
-        email_points = hist_plot[hist_plot["email_sent"].fillna(0).astype(int) == 1]
-        if not email_points.empty:
-            ax.scatter(
-                email_points["time"],
-                email_points["proba"],
-                marker="o",
-                s=60,
-                label="email sent"
+                    st.divider()
+                    s1, s2, s3 = st.columns([1.7, 1, 1])
+                    with s1:
+                        st.subheader(oslava_result["kayak_decision"])
+                        st.write(oslava_result["kayak_reason"])
+                        st.write(f"**ETA:** {oslava_result['eta']}")
+                        st.write("---")
+                        st.write(f"**Hydro stav:** {oslava_result['hydro_state']}")
+                    with s2:
+                        st.metric("P(vzestup za 2 h)", f"{100*oslava_result['proba']:.1f} %")
+                        st.metric("H Mostiště", f"{oslava_result['H_mostiste']:.1f} cm")
+                    with s3:
+                        st.metric("dH Mostiště / 1 h", f"{oslava_result['dH_mostiste_1h']:.1f} cm")
+                        st.metric("H Nesměř", f"{oslava_result['H_nesmer']:.1f} cm")
+                except Exception as e:
+                    st.warning(f"Oslava model se nepodařilo vyhodnotit: {e}")
+
+        st.divider()
+        cutoff = df_dual.index.max() - pd.Timedelta("48h")
+
+        st.subheader("Posledních 48 hodin – hladiny")
+        st.line_chart(
+            df_dual.loc[df_dual.index >= cutoff, ["H_upstream", "H_downstream"]]
+        )
+
+        st.subheader("Rozdíl hladin")
+        st.line_chart(df_dual.loc[df_dual.index >= cutoff, ["delta_H_2minus1"]])
+
+        st.subheader("Krátkodobé změny")
+        trend_cols = [c for c in ["dH_upstream_1h", "dH_downstream_1h"] if c in df_dual.columns]
+        if trend_cols:
+            st.line_chart(df_dual.loc[df_dual.index >= cutoff, trend_cols])
+
+        st.subheader("Lag korelace")
+        lag_df = estimate_lag_correlation(df_dual, "H_upstream", "H_downstream", max_lag_h=6)
+        best_row = lag_df.loc[lag_df["corr"].idxmax()] if lag_df["corr"].notna().any() else None
+
+        if best_row is not None:
+            st.write(
+                f"**Max korelace:** {best_row['corr']:.3f} při lagu ≈ {best_row['lag_hours']:.2f} h"
             )
 
-        ax.axhline(0.2, linestyle="--", linewidth=1, label="watch threshold")
-        ax.axhline(0.5, linestyle="--", linewidth=1, label="alert threshold")
-        ax.set_ylabel("Probability")
-        ax.set_xlabel("Time")
-        ax.set_title("Pravděpodobnost vzestupu hladiny a odeslané emaily")
-        ax.legend()
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(lag_df["lag_hours"], lag_df["corr"])
+        ax.set_xlabel("Lag [h]")
+        ax.set_ylabel("Correlation")
+        ax.set_title("Lag korelace profil 1 vs profil 2")
         ax.grid(True, alpha=0.3)
         st.pyplot(fig)
 
-        st.write("### Timeline alertů")
-        timeline_df = hist_recent.dropna(subset=["time"]).copy()
-
-        color_map = {
-            "NO_ALERT": "#9e9e9e",
-            "WATCH": "#f39c12",
-            "ALERT": "#d62728",
-        }
-
-        timeline_df["color"] = timeline_df["alert_level"].map(color_map).fillna("#9e9e9e")
-        timeline_df["y"] = 1.0
-
-        fig2, ax2 = plt.subplots(figsize=(12, 2.5))
-        ax2.scatter(
-            timeline_df["time"],
-            timeline_df["y"],
-            c=timeline_df["color"],
-            s=50,
-            alpha=0.9
-        )
-
-        email_timeline = timeline_df[timeline_df["email_sent"].fillna(0).astype(int) == 1]
-        if not email_timeline.empty:
-            ax2.scatter(
-                email_timeline["time"],
-                email_timeline["y"],
-                marker="s",
-                s=110,
-                linewidths=1.5,
-                label="email sent"
-            )
-
-        ax2.set_yticks([])
-        ax2.set_xlabel("Time")
-        ax2.set_title("Barevný timeline alert levelů")
-        ax2.grid(True, axis="x", alpha=0.3)
-
-        legend_elements = [
-            Line2D([0], [0], marker="o", linestyle="None", label="NO_ALERT", markersize=8),
-            Line2D([0], [0], marker="o", linestyle="None", label="WATCH", markersize=8),
-            Line2D([0], [0], marker="o", linestyle="None", label="ALERT", markersize=8),
-            Line2D([0], [0], marker="s", linestyle="None", label="email sent", markersize=8),
-        ]
-        ax2.legend(handles=legend_elements, loc="upper right")
-        st.pyplot(fig2)
-
-        st.write("### Poslední alerty")
-        show_cols = [
-            "time",
-            "alert_level",
-            "kayak_decision",
-            "eta",
-            "proba",
-            "H_mostiste",
-            "H_nesmer",
-            "email_sent",
-            "anti_spam_reason",
-        ]
-        st.dataframe(
-            hist_recent[show_cols].sort_values("time", ascending=False).head(50),
-            width="stretch",
-        )
-
-    st.divider()
-
-    if st.button("🔄 Obnovit data"):
-        st.cache_data.clear()
-        st.rerun()
-
-    cutoff = live_features.index.max() - pd.Timedelta("48h")
-
-    st.subheader("Posledních 48 hodin")
-    recent = live_features.loc[live_features.index >= cutoff, ["H_mostiste", "H_nesmer"]]
-    st.line_chart(recent)
-
-    st.subheader("Trend pod hrází")
-    recent_dh = live_features.loc[
-        live_features.index >= cutoff,
-        ["dH_mostiste_1h", "dH_mostiste_2h", "rolling_dH_3h"]
-    ]
-    st.line_chart(recent_dh)
-
-    with st.expander("Poslední řádky dat"):
-        st.dataframe(
-            live_features[
-                [
-                    "H_mostiste",
-                    "Q_mostiste",
-                    "dH_mostiste_1h",
-                    "dH_mostiste_2h",
-                    "rolling_dH_3h",
-                    "H_nesmer",
-                ]
-            ].tail(20),
-            width="stretch",
-        )
+        with st.expander("Detail dat"):
+            show_cols = [
+                "H_upstream", "Q_upstream",
+                "H_downstream", "Q_downstream",
+                "dH_upstream_1h", "dH_downstream_1h",
+                "delta_H_2minus1",
+            ]
+            show_cols = [c for c in show_cols if c in df_dual.columns]
+            st.dataframe(df_dual[show_cols].tail(30), width="stretch")
 
 except Exception as e:
-    st.error(f"Dashboardu se nepodařilo načíst live data: {e}")
-    st.stop()
+    st.error(f"Dashboardu se nepodařilo načíst data: {e}")
