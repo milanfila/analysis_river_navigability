@@ -89,6 +89,12 @@ def safe_float(value) -> float:
         return float("nan")
 
 
+def get_session_model_key(pair_id: Optional[str]) -> Optional[str]:
+    if not pair_id:
+        return None
+    return f"active_model::{pair_id}"
+
+
 # =========================================================
 # METADATA STANIC
 # =========================================================
@@ -748,9 +754,6 @@ try:
         st.error("Profil 1 a profil 2 nesmí být stejná stanice.")
         st.stop()
 
-    # -----------------------------------------------------
-    # SINGLE PROFILE
-    # -----------------------------------------------------
     if station2_id is None:
         live1 = fetch_station_now(station1_id)
         feat1 = build_single_station_features(live1)
@@ -798,9 +801,6 @@ try:
             show_cols = [c for c in ["H", "Q", "dH_1h", "dH_2h", "rolling_dH_3h"] if c in feat1.columns]
             st.dataframe(feat1[show_cols].tail(30), width="stretch")
 
-    # -----------------------------------------------------
-    # DUAL PROFILE
-    # -----------------------------------------------------
     else:
         live1 = fetch_station_now(station1_id)
         live2 = fetch_station_now(station2_id)
@@ -842,18 +842,24 @@ try:
         st.dataframe(map_df, width="stretch")
 
         selected_model_key = None
+        session_model_key = get_session_model_key(selected_pair_id)
+        session_model = st.session_state.get(session_model_key) if session_model_key else None
         auto_pair_model = None
+
         if selection_mode == "Doporučené dvojice" and selected_pair is not None:
             selected_model_key = selected_pair.get("model_key")
-            auto_pair_model = load_pair_model_if_exists(selected_pair_id)
-        elif selection_mode == "Vlastní výběr" and selected_pair_id is not None:
+
+        if session_model is not None:
+            auto_pair_model = session_model
+        elif selected_pair_id is not None:
             auto_pair_model = load_pair_model_if_exists(selected_pair_id)
 
         st.divider()
         st.subheader("Model pro vybranou dvojici")
 
         if auto_pair_model is not None:
-            st.success(f"Automaticky načten model: models/{selected_pair_id}.json")
+            model_source_label = "session model" if session_model is not None else f"models/{selected_pair_id}.json"
+            st.success(f"Aktivní model: {model_source_label}")
             st.write(f"**Model type:** {auto_pair_model.get('model_type', '-')}")
             st.write(f"**Forecast horizon:** {auto_pair_model.get('forecast_h', '-')}")
             st.write(f"**Tréninkové roky:** {auto_pair_model.get('train_years', '-')}")
@@ -993,10 +999,6 @@ try:
                         }
                     )
 
-                    st.success("Model byl natrénován z historical dat.")
-                    st.write(f"**Počet vzorků:** {trained_model['n_samples']}")
-                    st.write(f"**AUC test:** {trained_model['auc_test']:.3f}")
-
                     if LOCAL_SAVE_ENABLED:
                         try:
                             saved_path = save_model_to_models_dir(trained_model, pair_id_for_save)
@@ -1006,6 +1008,13 @@ try:
                                 "Model se nepodařilo uložit lokálně do `models/`. "
                                 f"Na některých cloudech je filesystem dočasný. Detail: {e}"
                             )
+
+                    session_model_key = get_session_model_key(pair_id_for_save)
+                    st.session_state[session_model_key] = trained_model
+
+                    st.success("Model byl natrénován z historical dat.")
+                    st.write(f"**Počet vzorků:** {trained_model['n_samples']}")
+                    st.write(f"**AUC test:** {trained_model['auc_test']:.3f}")
 
                     coef_df = pd.Series(trained_model["coefficients"]).to_frame("coef")
                     st.dataframe(coef_df, width="stretch")
@@ -1031,6 +1040,9 @@ try:
 
                     with st.expander("Model JSON preview"):
                         st.json(trained_model)
+
+                    st.success("Nový model byl aktivován pro aktuální dvojici. Dashboard se obnoví.")
+                    st.rerun()
 
                 except Exception as e:
                     st.error(f"Trénink modelu selhal: {e}")
