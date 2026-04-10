@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import math
 from pathlib import Path
@@ -7,14 +9,15 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 import streamlit as st
-from matplotlib.lines import Line2D
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
 st.set_page_config(page_title="Hydro multiprofile dashboard", page_icon="🌊", layout="wide")
 
 LOCAL_TZ = "Europe/Prague"
+
 BASE_NOW = "https://opendata.chmi.cz/hydrology/now/data"
+BASE_HIST = "https://opendata.chmi.cz/hydrology/historical/data/hourly"
 META_URL = "https://opendata.chmi.cz/hydrology/historical/metadata/meta1.json"
 
 LOCAL_META_PATHS = [
@@ -27,6 +30,9 @@ DEFAULT_MODEL_PATHS = [
     Path("models/oslava_model_rise_tplus2h.json"),
     Path("basic_dashboard/oslava_model_rise_tplus2h.json"),
 ]
+
+MODELS_DIR = Path("models")
+LOCAL_SAVE_ENABLED = True
 
 RECOMMENDED_PAIRS = [
     {
@@ -66,6 +72,21 @@ RECOMMENDED_PAIRS = [
         "model_key": None,
     },
 ]
+
+
+# =========================================================
+# OBECNÉ POMOCNÉ FUNKCE
+# =========================================================
+def parse_dt_to_local(series, local_tz: str = LOCAL_TZ) -> pd.DatetimeIndex:
+    dt = pd.to_datetime(pd.Series(series).astype(str), utc=True, errors="coerce")
+    return pd.DatetimeIndex(dt).tz_convert(local_tz)
+
+
+def safe_float(value) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float("nan")
 
 
 # =========================================================
@@ -110,27 +131,48 @@ def _parse_meta_json(obj: dict) -> pd.DataFrame:
     df = df.rename(columns=rename_map)
 
     num_cols = [
-        "lat", "lon",
-        "dry_h", "spa1_h", "spa2_h", "spa3_h", "spa4_h",
-        "dry_q", "spa1_q", "spa2_q", "spa3_q", "spa4_q",
+        "lat",
+        "lon",
+        "dry_h",
+        "spa1_h",
+        "spa2_h",
+        "spa3_h",
+        "spa4_h",
+        "dry_q",
+        "spa1_q",
+        "spa2_q",
+        "spa3_q",
+        "spa4_q",
         "catchment_area_km2",
     ]
     for c in num_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    for c in [
-        "station_id", "station_code", "station_name", "stream_name",
-        "spa_type", "stage_unit", "flow_unit", "basin_code"
-    ]:
+    text_cols = [
+        "station_id",
+        "station_code",
+        "station_name",
+        "stream_name",
+        "spa_type",
+        "stage_desc",
+        "stage_unit",
+        "flow_desc",
+        "flow_unit",
+        "basin_code",
+    ]
+    for c in text_cols:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
 
     df["label"] = (
-        df["stream_name"].fillna("") + " | "
-        + df["station_name"].fillna("") + " | "
+        df["stream_name"].fillna("")
+        + " | "
+        + df["station_name"].fillna("")
+        + " | "
         + df["station_id"].fillna("")
     )
+
     return df
 
 
@@ -150,7 +192,9 @@ def load_station_catalog(meta_url: str = META_URL, timeout: int = 30) -> tuple[p
     except Exception:
         local_path = _find_local_meta_path()
         if local_path is None:
-            raise FileNotFoundError("Nepodařilo se načíst metadata z webu a lokální hydro_meta1.json nebyl nalezen.")
+            raise FileNotFoundError(
+                "Nepodařilo se načíst metadata z webu a lokální hydro_meta1.json nebyl nalezen."
+            )
         with open(local_path, "r", encoding="utf-8") as f:
             obj = json.load(f)
         return _parse_meta_json(obj), f"local ({local_path})"
@@ -181,7 +225,7 @@ def get_recommended_pair_by_label(label: str) -> dict:
 
 
 @st.cache_data(ttl=24 * 3600)
-def get_station_catalog():
+def get_station_catalog() -> tuple[pd.DataFrame, str]:
     df_meta, source = load_station_catalog()
     df_meta = prepare_station_options(df_meta)
     return df_meta, source
@@ -190,11 +234,6 @@ def get_station_catalog():
 # =========================================================
 # LIVE DATA
 # =========================================================
-def parse_chmi_dt(series, local_tz: str = LOCAL_TZ):
-    dt = pd.to_datetime(pd.Series(series).astype(str), utc=True, errors="coerce")
-    return pd.DatetimeIndex(dt).tz_convert(local_tz)
-
-
 def extract_dt_val_from_tsdata(tsdata, code: str) -> Optional[pd.DataFrame]:
     if not isinstance(tsdata, list) or len(tsdata) == 0:
         return None
@@ -251,7 +290,7 @@ def extract_ts_from_live_json(obj: dict) -> pd.DataFrame:
     for tmp in frames[1:]:
         out = out.merge(tmp, on="dt", how="outer")
 
-    out["dt"] = parse_chmi_dt(out["dt"])
+    out["dt"] = parse_dt_to_local(out["dt"])
     out = out.set_index("dt").sort_index()
     return out.rename(columns={"H": "H_live", "Q": "Q_live"})
 
@@ -295,30 +334,133 @@ def build_dual_station_features(df1: pd.DataFrame, df2: pd.DataFrame, label1: st
     df[f"rolling_{label1}_3h"] = df[f"dH_{label1}_1h"].rolling(18, min_periods=6).mean()
     df[f"rolling_{label2}_3h"] = df[f"dH_{label2}_1h"].rolling(18, min_periods=6).mean()
     df["delta_H_2minus1"] = df[f"H_{label2}"] - df[f"H_{label1}"]
+
     return df
 
 
 # =========================================================
-# MODEL PRO OSLAVU
+# HISTORICAL DATA
 # =========================================================
-def find_default_model_file() -> Optional[Path]:
-    for path in DEFAULT_MODEL_PATHS:
-        if path.exists():
-            return path
-    return None
+def extract_hourly_hh_from_historical_json(obj: dict) -> pd.DataFrame:
+    ts_list = obj.get("tsList", [])
+    if not ts_list:
+        return pd.DataFrame()
+
+    hh_ts = None
+    for ts in ts_list:
+        if ts.get("tsConID") == "HH":
+            hh_ts = ts
+            break
+
+    if hh_ts is None:
+        return pd.DataFrame()
+
+    ts_data = hh_ts.get("tsData", {}).get("data", {})
+    header = ts_data.get("header")
+    values = ts_data.get("values", [])
+
+    if not header or not values:
+        return pd.DataFrame()
+
+    cols = [c.strip() for c in header.split(",")]
+    df = pd.DataFrame(values, columns=cols)
+
+    dt_col = "DT" if "DT" in df.columns else "dt"
+    val_col = "VAL" if "VAL" in df.columns else "value"
+
+    df["dt"] = pd.to_datetime(df[dt_col], utc=True, errors="coerce").dt.tz_convert(LOCAL_TZ)
+    df["H"] = pd.to_numeric(df[val_col], errors="coerce")
+
+    return df.set_index("dt")[["H"]].sort_index()
+
+
+@st.cache_data(ttl=24 * 3600)
+def fetch_station_historical_hourly(station_id: str, years: list[int]) -> pd.DataFrame:
+    frames = []
+
+    for year in years:
+        url = f"{BASE_HIST}/H_{station_id}_HQ_{year}.json"
+        try:
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            obj = r.json()
+            df_year = extract_hourly_hh_from_historical_json(obj)
+            if not df_year.empty:
+                frames.append(df_year)
+        except Exception:
+            continue
+
+    if not frames:
+        return pd.DataFrame(columns=["H"])
+
+    df = pd.concat(frames).sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    return df
+
+
+def build_historical_dual_features(df1_hist: pd.DataFrame, df2_hist: pd.DataFrame) -> pd.DataFrame:
+    df = df1_hist.rename(columns={"H": "H_upstream"}).join(
+        df2_hist.rename(columns={"H": "H_downstream"}),
+        how="inner",
+    ).sort_index()
+
+    df["dH_upstream_1h"] = df["H_upstream"] - df["H_upstream"].shift(1)
+    df["dH_upstream_2h"] = df["H_upstream"] - df["H_upstream"].shift(2)
+    df["rolling_upstream_3h"] = df["dH_upstream_1h"].rolling(3, min_periods=2).mean()
+
+    df["dH_downstream_1h"] = df["H_downstream"] - df["H_downstream"].shift(1)
+    df["delta_H_2minus1"] = df["H_downstream"] - df["H_upstream"]
+
+    return df
+
+
+# =========================================================
+# MODELY - LOAD / SAVE / EVAL
+# =========================================================
+def ensure_models_dir() -> Path:
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    return MODELS_DIR
+
+
+def get_pair_model_path(pair_id: str) -> Path:
+    return MODELS_DIR / f"{pair_id}.json"
+
+
+def save_model_to_models_dir(model_json: dict, pair_id: str) -> Path:
+    models_dir = ensure_models_dir()
+    out_path = models_dir / f"{pair_id}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(model_json, f, ensure_ascii=False, indent=2)
+    return out_path
 
 
 def load_model_json(path: Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         model = json.load(f)
 
-    coeffs = model["coefficients"]
+    coeffs = model.get("coefficients", {})
     return {
         **model,
         "intercept": float(model["intercept"]),
         "coefficients": {k: float(v) for k, v in coeffs.items()},
         "source": str(path),
     }
+
+
+def load_pair_model_if_exists(pair_id: Optional[str]) -> Optional[dict]:
+    if not pair_id:
+        return None
+    path = get_pair_model_path(pair_id)
+    if not path.exists():
+        return None
+    return load_model_json(path)
+
+
+def find_default_model_file() -> Optional[Path]:
+    for path in DEFAULT_MODEL_PATHS:
+        if path.exists():
+            return path
+    return None
 
 
 def sigmoid(x: float) -> float:
@@ -392,32 +534,60 @@ def evaluate_oslava_nowcast(df_dual: pd.DataFrame, model: dict) -> dict:
     }
 
 
-# =========================================================
-# ANALYTIKA
-# =========================================================
-def estimate_lag_correlation(df: pd.DataFrame, up_col: str, down_col: str, max_lag_h: int = 6) -> pd.DataFrame:
-    rows = []
-    for lag_steps in range(0, max_lag_h * 6 + 1):
-        corr = df[up_col].corr(df[down_col].shift(-lag_steps))
-        rows.append({
-            "lag_steps_10min": lag_steps,
-            "lag_hours": lag_steps / 6,
-            "corr": corr,
-        })
-    return pd.DataFrame(rows)
+def evaluate_generic_pair_nowcast(df_dual: pd.DataFrame, model: dict) -> dict:
+    df = pd.DataFrame(index=df_dual.index)
+    df["H_upstream"] = df_dual["H_upstream"]
+    df["H_downstream"] = df_dual["H_downstream"]
+    df["Q_upstream"] = df_dual.get("Q_upstream")
+    df["dH_upstream_1h"] = df_dual["dH_upstream_1h"]
+    df["dH_upstream_2h"] = df_dual["dH_upstream_2h"]
+    df["rolling_upstream_3h"] = df_dual["rolling_upstream_3h"]
+
+    required = list(set(model.get("features", [])))
+    if not required:
+        raise ValueError("Model nemá definované features.")
+
+    last = df.dropna(subset=required).iloc[-1]
+    proba = predict_proba(last, model)
+
+    if proba >= 0.75:
+        state = "🔴 SILNÝ SIGNÁL"
+    elif proba >= 0.50:
+        state = "🟡 MOŽNÝ SIGNÁL"
+    else:
+        state = "🟢 KLID"
+
+    return {
+        "time": last.name,
+        "proba": float(proba),
+        "state": state,
+        "H_upstream": float(last["H_upstream"]) if pd.notna(last.get("H_upstream")) else float("nan"),
+        "H_downstream": float(last["H_downstream"]) if pd.notna(last.get("H_downstream")) else float("nan"),
+    }
 
 
-def train_experimental_pair_model(df_dual: pd.DataFrame, forecast_h: int = 2, rise_thr_cm: float = 2.0) -> dict:
-    """
-    Experimentální MVP model:
-    target = zda downstream za +forecast_h hodin vzroste o alespoň rise_thr_cm.
-    Vstupy = upstream H a změny.
-    Trénuje se nad dostupnou časovou řadou v df_dual.
-    """
-    df = df_dual.copy()
+def train_pair_model_from_history(
+    station1_id: str,
+    station2_id: str,
+    forecast_h: int = 2,
+    rise_thr_cm: float = 2.0,
+    years: Optional[list[int]] = None,
+) -> tuple[dict, pd.DataFrame]:
+    if years is None:
+        years = list(range(2020, 2025))
 
-    steps = forecast_h * 6  # 10min data
-    df["target_rise"] = ((df["H_downstream"].shift(-steps) - df["H_downstream"]) >= rise_thr_cm).astype(float)
+    hist1 = fetch_station_historical_hourly(station1_id, years)
+    hist2 = fetch_station_historical_hourly(station2_id, years)
+
+    if hist1.empty or hist2.empty:
+        raise ValueError("Nepodařilo se načíst historical data pro jednu nebo obě stanice.")
+
+    df = build_historical_dual_features(hist1, hist2)
+
+    steps = forecast_h
+    df["target_rise"] = (
+        (df["H_downstream"].shift(-steps) - df["H_downstream"]) >= rise_thr_cm
+    ).astype(float)
 
     features = [
         "H_upstream",
@@ -428,8 +598,8 @@ def train_experimental_pair_model(df_dual: pd.DataFrame, forecast_h: int = 2, ri
 
     model_df = df.dropna(subset=features + ["target_rise"]).copy()
 
-    if len(model_df) < 50:
-        raise ValueError(f"Pro experimentální trénink je zatím málo vzorků: {len(model_df)}")
+    if len(model_df) < 200:
+        raise ValueError(f"Pro trénink je málo vzorků: {len(model_df)}")
 
     if model_df["target_rise"].nunique() < 2:
         raise ValueError("Target nemá obě třídy. Zkus změnit rise_thr_cm nebo forecast_h.")
@@ -440,34 +610,63 @@ def train_experimental_pair_model(df_dual: pd.DataFrame, forecast_h: int = 2, ri
     y_train = model_df["target_rise"].iloc[:split_idx]
     y_test = model_df["target_rise"].iloc[split_idx:]
 
-    clf = LogisticRegression(max_iter=2000)
+    clf = LogisticRegression(max_iter=3000)
     clf.fit(X_train, y_train)
 
     test_proba = clf.predict_proba(X_test)[:, 1]
     auc = roc_auc_score(y_test, test_proba)
 
-    return {
-        "model_type": "rise_prediction_experimental",
-        "forecast_h": forecast_h,
-        "rise_threshold_cm": rise_thr_cm,
+    model_json = {
+        "model_type": "rise_prediction",
+        "forecast_h": int(forecast_h),
+        "rise_threshold_cm": float(rise_thr_cm),
         "features": features,
         "intercept": float(clf.intercept_[0]),
         "coefficients": {f: float(c) for f, c in zip(features, clf.coef_[0])},
+        "threshold": 0.5,
         "auc_test": float(auc),
         "n_samples": int(len(model_df)),
         "class_balance": {
             "0": int((model_df["target_rise"] == 0).sum()),
             "1": int((model_df["target_rise"] == 1).sum()),
         },
+        "train_years": years,
+        "upstream_id": station1_id,
+        "downstream_id": station2_id,
     }
+
+    return model_json, model_df
+
+
+# =========================================================
+# ANALYTIKA
+# =========================================================
+def estimate_lag_correlation(df: pd.DataFrame, up_col: str, down_col: str, max_lag_h: int = 6) -> pd.DataFrame:
+    rows = []
+    for lag_steps in range(0, max_lag_h * 6 + 1):
+        corr = df[up_col].corr(df[down_col].shift(-lag_steps))
+        rows.append(
+            {
+                "lag_steps_10min": lag_steps,
+                "lag_hours": lag_steps / 6,
+                "corr": corr,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 # =========================================================
 # UI
 # =========================================================
 st.title("🌊 Hydro multiprofile dashboard")
-st.caption("Výběr 1 nebo 2 hlásných profilů z aktuálního katalogu ČHMÚ. Pro Oslavu Mostiště → Nesměř se použije i kajak/model logika.")
-st.info("Dashboard podporuje dva režimy: doporučené hydrologicky smysluplné dvojice a vlastní experimentální výběr profilů.")
+st.caption(
+    "Výběr 1 nebo 2 hlásných profilů z aktuálního katalogu ČHMÚ. "
+    "Pro Oslavu Mostiště → Nesměř se použije i kajak/model logika."
+)
+st.info(
+    "Dashboard podporuje dva režimy: doporučené hydrologicky smysluplné dvojice "
+    "a vlastní experimentální výběr profilů."
+)
 
 df_meta, meta_source = get_station_catalog()
 
@@ -486,12 +685,14 @@ with st.sidebar:
     station1_id = None
     station2_id = None
     selected_pair = None
+    selected_pair_id = None
 
     if selection_mode == "Doporučené dvojice":
         pair_labels = [p["label"] for p in RECOMMENDED_PAIRS]
         selected_pair_label = st.selectbox("Doporučená dvojice", pair_labels, index=0)
 
         selected_pair = get_recommended_pair_by_label(selected_pair_label)
+        selected_pair_id = selected_pair.get("pair_id")
 
         station1_row = get_station_row_by_id(df_meta, selected_pair["upstream_id"])
         station2_row = get_station_row_by_id(df_meta, selected_pair["downstream_id"])
@@ -520,9 +721,11 @@ with st.sidebar:
         if station2_label == "(jen jeden profil)":
             station2_id = None
             station2_row = None
+            selected_pair_id = None
         else:
             station2_row = river_df[river_df["label"] == station2_label].iloc[0]
             station2_id = station2_row["station_id"]
+            selected_pair_id = f"custom_{station1_id}_{station2_id}"
 
         st.write("**Profil 1:**", station1_row["station_name"])
         st.write("**ID 1:**", station1_id)
@@ -538,6 +741,7 @@ with st.sidebar:
             st.write(
                 f"Profil 2: {station2_row['station_name']} | lat={station2_row['lat']}, lon={station2_row['lon']}"
             )
+
 
 try:
     if station2_id is not None and station1_id == station2_id:
@@ -560,14 +764,28 @@ try:
             st.write(f"**Řeka:** {station1_row['stream_name']}")
             st.write(f"**Poslední update:** {last.name}")
         with c2:
-            st.metric("H", f"{float(last['H']):.1f} cm")
-            q_val = float(last["Q"]) if pd.notna(last.get("Q")) else None
-            st.metric("Q", f"{q_val:.3f} m³/s" if q_val is not None else "-")
+            st.metric("H", f"{safe_float(last['H']):.1f} cm")
+            q_val = safe_float(last["Q"]) if pd.notna(last.get("Q")) else None
+            st.metric("Q", f"{q_val:.3f} m³/s" if q_val is not None and not pd.isna(q_val) else "-")
         with c3:
-            dh1 = float(last["dH_1h"]) if pd.notna(last.get("dH_1h")) else float("nan")
-            roll = float(last["rolling_dH_3h"]) if pd.notna(last.get("rolling_dH_3h")) else float("nan")
+            dh1 = safe_float(last["dH_1h"]) if pd.notna(last.get("dH_1h")) else float("nan")
+            roll = safe_float(last["rolling_dH_3h"]) if pd.notna(last.get("rolling_dH_3h")) else float("nan")
             st.metric("dH / 1 h", f"{dh1:.1f} cm")
             st.metric("rolling dH / 3 h", f"{roll:.2f} cm")
+
+        st.divider()
+        st.subheader("Mapa stanice")
+        map_df = pd.DataFrame(
+            [
+                {
+                    "station_name": station1_row["station_name"],
+                    "latitude": station1_row["lat"],
+                    "longitude": station1_row["lon"],
+                }
+            ]
+        )
+        st.map(map_df)
+        st.dataframe(map_df, width="stretch")
 
         cutoff = feat1.index.max() - pd.Timedelta("48h")
         st.subheader("Posledních 48 hodin")
@@ -597,15 +815,65 @@ try:
             st.write(f"**Profil 2:** {station2_row['station_name']}")
             st.write(f"**Poslední update:** {last_dual.name}")
         with c2:
-            st.metric("H profil 1", f"{float(last_dual['H_upstream']):.1f} cm")
-            st.metric("H profil 2", f"{float(last_dual['H_downstream']):.1f} cm")
+            st.metric("H profil 1", f"{safe_float(last_dual['H_upstream']):.1f} cm")
+            st.metric("H profil 2", f"{safe_float(last_dual['H_downstream']):.1f} cm")
         with c3:
-            delta_h = float(last_dual["delta_H_2minus1"]) if pd.notna(last_dual.get("delta_H_2minus1")) else float("nan")
+            delta_h = safe_float(last_dual["delta_H_2minus1"]) if pd.notna(last_dual.get("delta_H_2minus1")) else float("nan")
             st.metric("H2 - H1", f"{delta_h:.1f} cm")
 
+        st.divider()
+        st.subheader("Mapa vybraných stanic")
+        map_rows = [
+            {
+                "role": "upstream",
+                "station_name": station1_row["station_name"],
+                "latitude": station1_row["lat"],
+                "longitude": station1_row["lon"],
+            },
+            {
+                "role": "downstream",
+                "station_name": station2_row["station_name"],
+                "latitude": station2_row["lat"],
+                "longitude": station2_row["lon"],
+            },
+        ]
+        map_df = pd.DataFrame(map_rows)
+        st.map(map_df[["latitude", "longitude"]])
+        st.dataframe(map_df, width="stretch")
+
         selected_model_key = None
+        auto_pair_model = None
         if selection_mode == "Doporučené dvojice" and selected_pair is not None:
             selected_model_key = selected_pair.get("model_key")
+            auto_pair_model = load_pair_model_if_exists(selected_pair_id)
+        elif selection_mode == "Vlastní výběr" and selected_pair_id is not None:
+            auto_pair_model = load_pair_model_if_exists(selected_pair_id)
+
+        st.divider()
+        st.subheader("Model pro vybranou dvojici")
+
+        if auto_pair_model is not None:
+            st.success(f"Automaticky načten model: models/{selected_pair_id}.json")
+            st.write(f"**Model type:** {auto_pair_model.get('model_type', '-')}")
+            st.write(f"**Forecast horizon:** {auto_pair_model.get('forecast_h', '-')}")
+            st.write(f"**Tréninkové roky:** {auto_pair_model.get('train_years', '-')}")
+        else:
+            if selected_pair_id is not None:
+                st.info(f"Pro dvojici `{selected_pair_id}` zatím nebyl nalezen uložený model v `models/`.")
+
+        if auto_pair_model is not None:
+            try:
+                generic_model_result = evaluate_generic_pair_nowcast(df_dual, auto_pair_model)
+
+                g1, g2, g3 = st.columns(3)
+                with g1:
+                    st.metric("Model state", generic_model_result["state"])
+                with g2:
+                    st.metric("P(rise)", f"{100 * generic_model_result['proba']:.1f} %")
+                with g3:
+                    st.metric("Model time", str(generic_model_result["time"]))
+            except Exception as e:
+                st.warning(f"Automaticky načtený model se nepodařilo vyhodnotit: {e}")
 
         is_oslava_pair = selected_model_key == "oslava_rise_tplus2h" or (
             station1_id == "0-203-1-471000" and station2_id == "0-203-1-473000"
@@ -627,7 +895,7 @@ try:
                         st.write("---")
                         st.write(f"**Hydro stav:** {oslava_result['hydro_state']}")
                     with s2:
-                        st.metric("P(vzestup za 2 h)", f"{100*oslava_result['proba']:.1f} %")
+                        st.metric("P(vzestup za 2 h)", f"{100 * oslava_result['proba']:.1f} %")
                         st.metric("H Mostiště", f"{oslava_result['H_mostiste']:.1f} cm")
                     with s3:
                         st.metric("dH Mostiště / 1 h", f"{oslava_result['dH_mostiste_1h']:.1f} cm")
@@ -639,9 +907,7 @@ try:
         cutoff = df_dual.index.max() - pd.Timedelta("48h")
 
         st.subheader("Posledních 48 hodin – hladiny")
-        st.line_chart(
-            df_dual.loc[df_dual.index >= cutoff, ["H_upstream", "H_downstream"]]
-        )
+        st.line_chart(df_dual.loc[df_dual.index >= cutoff, ["H_upstream", "H_downstream"]])
 
         st.subheader("Rozdíl hladin")
         st.line_chart(df_dual.loc[df_dual.index >= cutoff, ["delta_H_2minus1"]])
@@ -656,9 +922,7 @@ try:
         best_row = lag_df.loc[lag_df["corr"].idxmax()] if lag_df["corr"].notna().any() else None
 
         if best_row is not None:
-            st.write(
-                f"**Max korelace:** {best_row['corr']:.3f} při lagu ≈ {best_row['lag_hours']:.2f} h"
-            )
+            st.write(f"**Max korelace:** {best_row['corr']:.3f} při lagu ≈ {best_row['lag_hours']:.2f} h")
 
         fig, ax = plt.subplots(figsize=(8, 4))
         ax.plot(lag_df["lag_hours"], lag_df["corr"])
@@ -668,66 +932,109 @@ try:
         ax.grid(True, alpha=0.3)
         st.pyplot(fig)
 
-        with st.expander("Detail dat"):
+        with st.expander("Detail live dat"):
             show_cols = [
-                "H_upstream", "Q_upstream",
-                "H_downstream", "Q_downstream",
-                "dH_upstream_1h", "dH_downstream_1h",
-                "dH_upstream_2h", "dH_downstream_2h",
-                "rolling_upstream_3h", "rolling_downstream_3h",
+                "H_upstream",
+                "Q_upstream",
+                "H_downstream",
+                "Q_downstream",
+                "dH_upstream_1h",
+                "dH_downstream_1h",
+                "dH_upstream_2h",
+                "dH_downstream_2h",
+                "rolling_upstream_3h",
+                "rolling_downstream_3h",
                 "delta_H_2minus1",
             ]
             show_cols = [c for c in show_cols if c in df_dual.columns]
             st.dataframe(df_dual[show_cols].tail(30), width="stretch")
 
         st.divider()
-        st.subheader("Experimentální trénink vlastního modelu")
-        st.caption("Tahle verze je MVP. Trénuje jednoduchý logistický model nad dostupnou časovou řadou v dashboardu. Pro plnohodnotný model je vhodné napojit historická data.")
+        st.subheader("Trénink vlastního modelu z historical dat")
+        st.caption("Trénink používá historical hourly HQ data (HH) pro zvolené roky.")
 
-        col_a, col_b = st.columns(2)
+        col_a, col_b, col_c = st.columns(3)
         with col_a:
-            forecast_h = st.number_input("Forecast horizon [h]", min_value=1, max_value=12, value=2, step=1)
+            forecast_h = st.number_input("Forecast horizon [h]", min_value=1, max_value=24, value=2, step=1)
         with col_b:
-            rise_thr_cm = st.number_input("Target rise threshold [cm]", min_value=0.5, max_value=20.0, value=2.0, step=0.5)
+            rise_thr_cm = st.number_input("Target rise threshold [cm]", min_value=0.5, max_value=30.0, value=2.0, step=0.5)
+        with col_c:
+            year_from = st.number_input("Od roku", min_value=2010, max_value=2025, value=2020, step=1)
 
-        train_model = st.button("Natrénovat model pro zvolenou dvojici")
+        year_to = st.number_input("Do roku", min_value=2010, max_value=2025, value=2024, step=1)
 
-        if train_model:
-            try:
-                trained_model = train_experimental_pair_model(
-                    df_dual=df_dual,
-                    forecast_h=int(forecast_h),
-                    rise_thr_cm=float(rise_thr_cm),
-                )
+        if year_to < year_from:
+            st.error("Koncový rok musí být >= počáteční rok.")
+        else:
+            train_years = list(range(int(year_from), int(year_to) + 1))
+            st.write("**Roky pro trénink:**", train_years)
 
-                st.success("Experimentální model byl natrénován.")
-                st.write(f"**Počet vzorků:** {trained_model['n_samples']}")
-                st.write(f"**AUC test:** {trained_model['auc_test']:.3f}")
+            train_model = st.button("Natrénovat model z historical dat")
 
-                coef_df = pd.Series(trained_model["coefficients"]).to_frame("coef")
-                st.dataframe(coef_df, width="stretch")
+            if train_model:
+                try:
+                    with st.spinner("Načítám historical data a trénuji model..."):
+                        trained_model, model_df = train_pair_model_from_history(
+                            station1_id=station1_id,
+                            station2_id=station2_id,
+                            forecast_h=int(forecast_h),
+                            rise_thr_cm=float(rise_thr_cm),
+                            years=train_years,
+                        )
 
-                model_export = {
-                    **trained_model,
-                    "upstream_id": station1_id,
-                    "downstream_id": station2_id,
-                    "upstream_name": station1_row["station_name"],
-                    "downstream_name": station2_row["station_name"],
-                    "stream_name": station1_row["stream_name"],
-                }
+                    pair_id_for_save = selected_pair_id if selected_pair_id else f"custom_{station1_id}_{station2_id}"
 
-                st.download_button(
-                    "Stáhnout model JSON",
-                    data=json.dumps(model_export, ensure_ascii=False, indent=2),
-                    file_name=f"model_{station1_id}_{station2_id}_tplus{forecast_h}h.json",
-                    mime="application/json",
-                )
+                    trained_model.update(
+                        {
+                            "pair_id": pair_id_for_save,
+                            "upstream_name": station1_row["station_name"],
+                            "downstream_name": station2_row["station_name"],
+                            "stream_name": station1_row["stream_name"],
+                        }
+                    )
 
-                with st.expander("Model JSON preview"):
-                    st.json(model_export)
+                    st.success("Model byl natrénován z historical dat.")
+                    st.write(f"**Počet vzorků:** {trained_model['n_samples']}")
+                    st.write(f"**AUC test:** {trained_model['auc_test']:.3f}")
 
-            except Exception as e:
-                st.error(f"Trénink modelu selhal: {e}")
+                    if LOCAL_SAVE_ENABLED:
+                        try:
+                            saved_path = save_model_to_models_dir(trained_model, pair_id_for_save)
+                            st.success(f"Model byl uložen do: {saved_path}")
+                        except Exception as e:
+                            st.warning(
+                                "Model se nepodařilo uložit lokálně do `models/`. "
+                                f"Na některých cloudech je filesystem dočasný. Detail: {e}"
+                            )
+
+                    coef_df = pd.Series(trained_model["coefficients"]).to_frame("coef")
+                    st.dataframe(coef_df, width="stretch")
+
+                    st.write("### Náhled tréninkových dat")
+                    preview_cols = [
+                        "H_upstream",
+                        "H_downstream",
+                        "dH_upstream_1h",
+                        "dH_upstream_2h",
+                        "rolling_upstream_3h",
+                        "target_rise",
+                    ]
+                    preview_cols = [c for c in preview_cols if c in model_df.columns]
+                    st.dataframe(model_df[preview_cols].tail(20), width="stretch")
+
+                    st.download_button(
+                        "Stáhnout model JSON",
+                        data=json.dumps(trained_model, ensure_ascii=False, indent=2),
+                        file_name=f"{pair_id_for_save}.json",
+                        mime="application/json",
+                    )
+
+                    with st.expander("Model JSON preview"):
+                        st.json(trained_model)
+
+                except Exception as e:
+                    st.error(f"Trénink modelu selhal: {e}")
 
 except Exception as e:
     st.error(f"Dashboardu se nepodařilo načíst data: {e}")
+    st.stop()
