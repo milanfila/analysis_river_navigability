@@ -153,7 +153,7 @@ def build_live_features() -> pd.DataFrame:
     out["Q_mostiste"] = pd.to_numeric(out.get("Q_mostiste_live"), errors="coerce")
     out["Q_nesmer"] = pd.to_numeric(out.get("Q_nesmer_live"), errors="coerce")
 
-    # data jsou po 10 minutách
+    # 10min data
     out["dH_mostiste_1h"] = out["H_mostiste"] - out["H_mostiste"].shift(6)
     out["dH_mostiste_2h"] = out["H_mostiste"] - out["H_mostiste"].shift(12)
     out["rolling_dH_3h"] = out["dH_mostiste_1h"].rolling(18, min_periods=6).mean()
@@ -181,6 +181,59 @@ def predict_proba(last_row: pd.Series, model: dict) -> float:
                 z += float(coef) * float(last_row[f])
 
     return sigmoid(z)
+
+
+def kayak_decision_layer(result: dict) -> dict:
+    """
+    Praktická kajak logika:
+    - aktuální sjízdnost podle H_nesmer
+    - forecast podle modelové pravděpodobnosti vzestupu
+    """
+    Hn = result["H_nesmer"]
+    proba = result["proba_tplus_2h"]
+
+    # pracovní prahy, lze později doladit
+    H_GO = 100.0
+    H_MAYBE = 90.0
+
+    if pd.notna(Hn) and Hn >= H_GO:
+        return {
+            "kayak_decision": "✅ JEĎ",
+            "kayak_reason": "Nesměř je aktuálně na sjízdné hladině.",
+            "eta": "teď",
+        }
+
+    if pd.notna(Hn) and H_MAYBE <= Hn < H_GO:
+        if proba >= 0.50:
+            return {
+                "kayak_decision": "⏳ ZA CHVÍLI",
+                "kayak_reason": "Nesměř je hraniční a model čeká další vzestup.",
+                "eta": "1–2 h",
+            }
+        return {
+            "kayak_decision": "🟡 SLEDUJ",
+            "kayak_reason": "Nesměř je hraniční, ale model zatím nevidí silný náběh vlny.",
+            "eta": "nejisté",
+        }
+
+    # H_nesmer < 90
+    if proba >= 0.50:
+        return {
+            "kayak_decision": "⏳ ZA CHVÍLI",
+            "kayak_reason": "Teď to ještě nevypadá sjízdně, ale model indikuje pravděpodobný náběh vlny.",
+            "eta": "1–2 h",
+        }
+    if proba >= 0.20:
+        return {
+            "kayak_decision": "🟡 SLEDUJ",
+            "kayak_reason": "Zatím nesjízdné, ale možný slabší nebo nejistý náběh vlny.",
+            "eta": "2–3 h / nejisté",
+        }
+    return {
+        "kayak_decision": "❌ NEJEĎ",
+        "kayak_reason": "Nesměř je nízko a model neukazuje významnou vlnu.",
+        "eta": "-",
+    }
 
 
 def evaluate_nowcast(df: pd.DataFrame, model: dict) -> dict:
@@ -223,6 +276,12 @@ def evaluate_nowcast(df: pd.DataFrame, model: dict) -> dict:
     else:
         hydro_note = "Bez výrazné změny odtoku."
 
+    base_result = {
+        "H_nesmer": float(last["H_nesmer"]) if pd.notna(last.get("H_nesmer")) else float("nan"),
+        "proba_tplus_2h": float(proba),
+    }
+    kayak = kayak_decision_layer(base_result)
+
     return {
         "time": last.name,
         "H_mostiste": float(last["H_mostiste"]),
@@ -237,11 +296,14 @@ def evaluate_nowcast(df: pd.DataFrame, model: dict) -> dict:
         "hydro_note": hydro_note,
         "metric_label": metric_label,
         "model_type": model.get("model_type", "legacy"),
+        "kayak_decision": kayak["kayak_decision"],
+        "kayak_reason": kayak["kayak_reason"],
+        "eta": kayak["eta"],
     }
 
 
 st.title("🚣 Oslava kajak dashboard")
-st.caption("Minimalistická live verze: Mostiště → Nesměř. Dashboard umí nowcast sjízdnosti i predikci vzestupu hladiny za cca 2 hodiny.")
+st.caption("Kajak mode: Mostiště → Nesměř. Dashboard kombinuje aktuální stav v Nesměři a model pravděpodobnosti vzestupu hladiny.")
 
 with st.sidebar:
     st.header("Model")
@@ -288,20 +350,27 @@ try:
     live_features = build_live_features()
     result = evaluate_nowcast(live_features, model)
 
-    c1, c2, c3 = st.columns([1.5, 1, 1])
+    c1, c2, c3 = st.columns([1.7, 1, 1])
     with c1:
-        st.subheader(result["decision"])
+        st.subheader(result["kayak_decision"])
+        st.write(result["kayak_reason"])
+        st.write(f"**ETA:** {result['eta']}")
+        st.write("---")
+        st.write(f"**Hydro stav:** {result['decision']}")
         st.write(result["explanation"])
         st.write(result["hydro_note"])
         st.write(f"**Poslední update:** {result['time']}")
         model_source = model_path_text if use_json_model else "ruční koeficienty"
         st.write(f"**Model:** {model_source}")
+
     with c2:
         st.metric(result["metric_label"], f"{100*result['proba_tplus_2h']:.1f} %")
         st.metric("H Mostiště", f"{result['H_mostiste']:.1f} cm")
+
     with c3:
         st.metric("dH Mostiště / 1 h", f"{result['dH_mostiste_1h']:.1f} cm")
         st.metric("H Nesměř", f"{result['H_nesmer']:.1f} cm")
+        st.metric("ETA", result["eta"])
 
     st.divider()
 
@@ -324,7 +393,14 @@ try:
 
     with st.expander("Poslední řádky dat"):
         st.dataframe(
-            live_features[["H_mostiste", "Q_mostiste", "dH_mostiste_1h", "dH_mostiste_2h", "rolling_dH_3h", "H_nesmer"]].tail(20),
+            live_features[[
+                "H_mostiste",
+                "Q_mostiste",
+                "dH_mostiste_1h",
+                "dH_mostiste_2h",
+                "rolling_dH_3h",
+                "H_nesmer",
+            ]].tail(20),
             width="stretch",
         )
 
