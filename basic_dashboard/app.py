@@ -3,9 +3,11 @@ import math
 from pathlib import Path
 from typing import Optional
 
+import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 import streamlit as st
+from matplotlib.lines import Line2D
 
 st.set_page_config(page_title="Oslava kajak dashboard", page_icon="🚣", layout="wide")
 
@@ -466,9 +468,76 @@ try:
         with h3:
             st.metric("ALERT count", int((hist_recent["alert_level"] == "ALERT").sum()))
 
-        st.write("### Pravděpodobnost v čase")
-        chart_df = hist_recent.set_index("time")[["proba"]].copy()
-        st.line_chart(chart_df)
+        st.write("### Pravděpodobnost v čase + odeslané emaily")
+        fig, ax = plt.subplots(figsize=(12, 4))
+
+        hist_plot = hist_recent.dropna(subset=["time", "proba"]).copy()
+        ax.plot(hist_plot["time"], hist_plot["proba"], label="proba", linewidth=2)
+
+        email_points = hist_plot[hist_plot["email_sent"].fillna(0).astype(int) == 1]
+        if not email_points.empty:
+            ax.scatter(
+                email_points["time"],
+                email_points["proba"],
+                marker="o",
+                s=60,
+                label="email sent"
+            )
+
+        ax.axhline(0.2, linestyle="--", linewidth=1, label="watch threshold")
+        ax.axhline(0.5, linestyle="--", linewidth=1, label="alert threshold")
+        ax.set_ylabel("Probability")
+        ax.set_xlabel("Time")
+        ax.set_title("Pravděpodobnost vzestupu hladiny a odeslané emaily")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        st.pyplot(fig)
+
+        st.write("### Timeline alertů")
+        timeline_df = hist_recent.dropna(subset=["time"]).copy()
+
+        color_map = {
+            "NO_ALERT": "#9e9e9e",
+            "WATCH": "#f39c12",
+            "ALERT": "#d62728",
+        }
+
+        timeline_df["color"] = timeline_df["alert_level"].map(color_map).fillna("#9e9e9e")
+        timeline_df["y"] = 1.0
+
+        fig2, ax2 = plt.subplots(figsize=(12, 2.5))
+        ax2.scatter(
+            timeline_df["time"],
+            timeline_df["y"],
+            c=timeline_df["color"],
+            s=50,
+            alpha=0.9
+        )
+
+        email_timeline = timeline_df[timeline_df["email_sent"].fillna(0).astype(int) == 1]
+        if not email_timeline.empty:
+            ax2.scatter(
+                email_timeline["time"],
+                email_timeline["y"],
+                marker="s",
+                s=110,
+                linewidths=1.5,
+                label="email sent"
+            )
+
+        ax2.set_yticks([])
+        ax2.set_xlabel("Time")
+        ax2.set_title("Barevný timeline alert levelů")
+        ax2.grid(True, axis="x", alpha=0.3)
+
+        legend_elements = [
+            Line2D([0], [0], marker="o", linestyle="None", label="NO_ALERT", markersize=8),
+            Line2D([0], [0], marker="o", linestyle="None", label="WATCH", markersize=8),
+            Line2D([0], [0], marker="o", linestyle="None", label="ALERT", markersize=8),
+            Line2D([0], [0], marker="s", linestyle="None", label="email sent", markersize=8),
+        ]
+        ax2.legend(handles=legend_elements, loc="upper right")
+        st.pyplot(fig2)
 
         st.write("### Poslední alerty")
         show_cols = [
