@@ -29,8 +29,14 @@ DEFAULT_MODEL = {
 DEFAULT_MODEL_PATHS = [
     Path("oslava_model_rise_tplus2h.json"),
     Path("models/oslava_model_rise_tplus2h.json"),
+    Path("basic_dashboard/oslava_model_rise_tplus2h.json"),
     Path("oslava_model_tplus2h.json"),
     Path("models/oslava_model_tplus2h.json"),
+]
+
+STATE_PATHS = [
+    Path("alert_state.json"),
+    Path("../alert_state.json"),
 ]
 
 
@@ -56,6 +62,30 @@ def find_model_file() -> Path | None:
         if path.exists():
             return path
     return None
+
+
+def find_state_file() -> Path | None:
+    for path in STATE_PATHS:
+        if path.exists():
+            return path
+    return None
+
+
+def load_alert_state() -> dict:
+    state_path = find_state_file()
+    if state_path is None:
+        return {
+            "last_alert_level": "NO_ALERT",
+            "last_sent_at": None,
+            "last_proba": 0.0,
+            "state_source": None,
+        }
+
+    with open(state_path, "r", encoding="utf-8") as f:
+        state = json.load(f)
+
+    state["state_source"] = str(state_path)
+    return state
 
 
 def parse_chmi_dt(series, local_tz: str = LOCAL_TZ):
@@ -184,15 +214,9 @@ def predict_proba(last_row: pd.Series, model: dict) -> float:
 
 
 def kayak_decision_layer(result: dict) -> dict:
-    """
-    Praktická kajak logika:
-    - aktuální sjízdnost podle H_nesmer
-    - forecast podle modelové pravděpodobnosti vzestupu
-    """
     Hn = result["H_nesmer"]
     proba = result["proba_tplus_2h"]
 
-    # pracovní prahy, lze později doladit
     H_GO = 100.0
     H_MAYBE = 90.0
 
@@ -216,7 +240,6 @@ def kayak_decision_layer(result: dict) -> dict:
             "eta": "nejisté",
         }
 
-    # H_nesmer < 90
     if proba >= 0.50:
         return {
             "kayak_decision": "⏳ ZA CHVÍLI",
@@ -303,7 +326,7 @@ def evaluate_nowcast(df: pd.DataFrame, model: dict) -> dict:
 
 
 st.title("🚣 Oslava kajak dashboard")
-st.caption("Kajak mode: Mostiště → Nesměř. Dashboard kombinuje aktuální stav v Nesměři a model pravděpodobnosti vzestupu hladiny.")
+st.caption("Kajak mode: Mostiště → Nesměř. Dashboard kombinuje aktuální stav v Nesměři, model vzestupu hladiny a historii alertů.")
 
 with st.sidebar:
     st.header("Model")
@@ -349,6 +372,7 @@ model = {
 try:
     live_features = build_live_features()
     result = evaluate_nowcast(live_features, model)
+    alert_state = load_alert_state()
 
     c1, c2, c3 = st.columns([1.7, 1, 1])
     with c1:
@@ -374,6 +398,25 @@ try:
 
     st.divider()
 
+    st.subheader("Poslední alert")
+    a1, a2, a3 = st.columns(3)
+
+    with a1:
+        st.metric("Last alert level", alert_state.get("last_alert_level", "NO_ALERT"))
+
+    with a2:
+        last_sent_at = alert_state.get("last_sent_at")
+        st.metric("Last email sent", last_sent_at if last_sent_at else "-")
+
+    with a3:
+        last_proba = alert_state.get("last_proba", 0.0)
+        st.metric("Last alert proba", f"{100*float(last_proba):.1f} %")
+
+    with st.expander("Detail alert state"):
+        st.json(alert_state)
+
+    st.divider()
+
     if st.button("🔄 Obnovit data"):
         st.cache_data.clear()
         st.rerun()
@@ -393,14 +436,16 @@ try:
 
     with st.expander("Poslední řádky dat"):
         st.dataframe(
-            live_features[[
-                "H_mostiste",
-                "Q_mostiste",
-                "dH_mostiste_1h",
-                "dH_mostiste_2h",
-                "rolling_dH_3h",
-                "H_nesmer",
-            ]].tail(20),
+            live_features[
+                [
+                    "H_mostiste",
+                    "Q_mostiste",
+                    "dH_mostiste_1h",
+                    "dH_mostiste_2h",
+                    "rolling_dH_3h",
+                    "H_nesmer",
+                ]
+            ].tail(20),
             width="stretch",
         )
 
