@@ -16,7 +16,7 @@ STATIONS = {
     "nesmer": "0-203-1-473000",
 }
 
-MODEL_PATH = Path("oslava_model_rise_tplus2h.json")
+MODEL_PATH = Path("models/oslava_model_rise_tplus2h.json")
 
 
 def env_float(name: str, default: float) -> float:
