@@ -9,6 +9,9 @@ concurrency:
   group: oslava-wave-alert
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   run-alert:
     runs-on: ubuntu-latest
@@ -16,6 +19,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -37,4 +42,6 @@ jobs:
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MODEL_ALERT_THRESHOLD: ${{ secrets.MODEL_ALERT_THRESHOLD }}
           MODEL_WATCH_THRESHOLD: ${{ secrets.MODEL_WATCH_THRESHOLD }}
+          ALERT_COOLDOWN_HOURS: ${{ secrets.ALERT_COOLDOWN_HOURS }}
+          ALERT_PROBA_JUMP: ${{ secrets.ALERT_PROBA_JUMP }}
         run: python check_wave.py

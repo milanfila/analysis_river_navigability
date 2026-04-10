@@ -2,6 +2,8 @@ import json
 import math
 import os
 import smtplib
+import subprocess
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -16,7 +18,8 @@ STATIONS = {
     "nesmer": "0-203-1-473000",
 }
 
-MODEL_PATH = Path("models/oslava_model_rise_tplus2h.json")
+MODEL_PATH = Path("basic_dashboard/oslava_model_rise_tplus2h.json")
+STATE_PATH = Path("alert_state.json")
 
 
 def env_float(name: str, default: float) -> float:
@@ -26,8 +29,19 @@ def env_float(name: str, default: float) -> float:
     return float(raw)
 
 
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if raw == "":
+        return int(default)
+    return int(raw)
+
+
 def sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def parse_chmi_dt(series):
@@ -121,9 +135,7 @@ def build_live_features() -> pd.DataFrame:
     out["H_mostiste"] = pd.to_numeric(out["H_mostiste_live"], errors="coerce")
     out["H_nesmer"] = pd.to_numeric(out["H_nesmer_live"], errors="coerce")
     out["Q_mostiste"] = pd.to_numeric(out.get("Q_mostiste_live"), errors="coerce")
-    out["Q_nesmer"] = pd.to_numeric(out.get("Q_nesmer_live"), errors="coerce")
 
-    # data po 10 min
     out["dH_mostiste_1h"] = out["H_mostiste"] - out["H_mostiste"].shift(6)
     out["dH_mostiste_2h"] = out["H_mostiste"] - out["H_mostiste"].shift(12)
     out["rolling_dH_3h"] = out["dH_mostiste_1h"].rolling(18, min_periods=6).mean()
@@ -201,6 +213,85 @@ def build_decision(last_row: pd.Series, proba: float, model: dict) -> dict:
     }
 
 
+def load_state() -> dict:
+    if not STATE_PATH.exists():
+        return {
+            "last_alert_level": "NO_ALERT",
+            "last_sent_at": None,
+            "last_proba": 0.0,
+        }
+
+    with open(STATE_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_state(state: dict) -> None:
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def hours_since(iso_ts: str | None) -> float:
+    if not iso_ts:
+        return 1e9
+    then = datetime.fromisoformat(iso_ts)
+    now = datetime.now(timezone.utc)
+    return (now - then).total_seconds() / 3600.0
+
+
+def should_send_alert(result: dict, state: dict) -> tuple[bool, str]:
+    cooldown_h = env_int("ALERT_COOLDOWN_HOURS", 6)
+    proba_jump = env_float("ALERT_PROBA_JUMP", 0.20)
+
+    prev_level = state.get("last_alert_level", "NO_ALERT")
+    prev_proba = float(state.get("last_proba", 0.0))
+    last_sent_at = state.get("last_sent_at")
+
+    current_level = result["alert_level"]
+    current_proba = float(result["proba"])
+
+    if current_level == "NO_ALERT":
+        return False, "no alert state"
+
+    # 1) změna úrovně
+    if current_level != prev_level:
+        return True, f"level change {prev_level} -> {current_level}"
+
+    # 2) velký skok pravděpodobnosti
+    if abs(current_proba - prev_proba) >= proba_jump:
+        return True, f"probability jump {prev_proba:.2f} -> {current_proba:.2f}"
+
+    # 3) cooldown
+    if hours_since(last_sent_at) >= cooldown_h:
+        return True, f"cooldown passed ({cooldown_h} h)"
+
+    return False, "suppressed by anti-spam"
+
+
+def commit_state_file() -> None:
+    if os.getenv("GITHUB_ACTIONS") != "true":
+        return
+
+    subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"],
+        check=True,
+    )
+
+    subprocess.run(["git", "add", str(STATE_PATH)], check=True)
+
+    diff_check = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        check=False,
+    )
+
+    if diff_check.returncode == 0:
+        print("No state changes to commit.")
+        return
+
+    subprocess.run(["git", "commit", "-m", "Update alert state [skip ci]"], check=True)
+    subprocess.run(["git", "push"], check=True)
+
+
 def send_email(subject: str, body: str) -> None:
     smtp_host = os.environ["SMTP_HOST"]
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
@@ -226,13 +317,17 @@ def main():
         raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
 
     model = load_model(MODEL_PATH)
-    live_features = build_live_features()
+    state = load_state()
 
+    live_features = build_live_features()
     required = list(set(["H_mostiste", "H_nesmer"] + model["features"]))
     last_row = live_features.dropna(subset=required).iloc[-1]
 
     proba = predict_proba(last_row, model)
     result = build_decision(last_row, proba, model)
+
+    send_it, send_reason = should_send_alert(result, state)
+    result["anti_spam_decision"] = send_reason
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
@@ -254,17 +349,23 @@ rolling dH / 3 h: {result['rolling_dH_3h']:.2f} cm
 Důvod:
 {result['reason']}
 
-Thresholds:
-WATCH = {result['watch_threshold']:.2f}
-ALERT = {result['alert_threshold']:.2f}
+Anti-spam:
+{send_reason}
 """
 
-    if result["alert_level"] in {"WATCH", "ALERT"}:
+    if send_it:
         subject = f"Oslava {result['alert_level']} – {result['kayak_decision']}"
         send_email(subject, body)
         print("Email sent.")
+        state["last_sent_at"] = utc_now_iso()
     else:
         print("No email sent.")
+
+    state["last_alert_level"] = result["alert_level"]
+    state["last_proba"] = float(result["proba"])
+
+    save_state(state)
+    commit_state_file()
 
 
 if __name__ == "__main__":
