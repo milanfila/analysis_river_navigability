@@ -7,6 +7,9 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 import streamlit as st
+from matplotlib.lines import Line2D
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
 
 st.set_page_config(page_title="Hydro multiprofile dashboard", page_icon="🌊", layout="wide")
 
@@ -14,7 +17,6 @@ LOCAL_TZ = "Europe/Prague"
 BASE_NOW = "https://opendata.chmi.cz/hydrology/now/data"
 META_URL = "https://opendata.chmi.cz/hydrology/historical/metadata/meta1.json"
 
-# fallback na lokální metadata
 LOCAL_META_PATHS = [
     Path("hydro_meta1.json"),
     Path("../hydro_meta1.json"),
@@ -24,6 +26,45 @@ DEFAULT_MODEL_PATHS = [
     Path("oslava_model_rise_tplus2h.json"),
     Path("models/oslava_model_rise_tplus2h.json"),
     Path("basic_dashboard/oslava_model_rise_tplus2h.json"),
+]
+
+RECOMMENDED_PAIRS = [
+    {
+        "pair_id": "oslava_mostiste_nesmer",
+        "label": "Oslava | VD Mostiště → Nesměř",
+        "stream_name": "Oslava",
+        "upstream_id": "0-203-1-471000",
+        "downstream_id": "0-203-1-473000",
+        "description": "Krátký regulovaný úsek pod VD Mostiště vhodný pro kajak model.",
+        "model_key": "oslava_rise_tplus2h",
+    },
+    {
+        "pair_id": "oslava_nesmer_oslavany",
+        "label": "Oslava | Nesměř → Oslavany",
+        "stream_name": "Oslava",
+        "upstream_id": "0-203-1-473000",
+        "downstream_id": "0-203-1-474000",
+        "description": "Delší downstream úsek Oslavy, vhodný pro experimentální lag analýzu.",
+        "model_key": None,
+    },
+    {
+        "pair_id": "jihlava_ptacov_mohelno",
+        "label": "Jihlava | Třebíč-Ptáčov → VD Mohelno",
+        "stream_name": "Jihlava",
+        "upstream_id": "0-203-1-469000",
+        "downstream_id": "0-203-1-469500",
+        "description": "Příklad doporučené dvojice na Jihlavě.",
+        "model_key": None,
+    },
+    {
+        "pair_id": "svratka_vir_bityska",
+        "label": "Svratka | VD Vír pod vyrovnávací nádrží → Veverská Bítýška",
+        "stream_name": "Svratka",
+        "upstream_id": "0-203-1-445000",
+        "downstream_id": "0-203-1-448000",
+        "description": "Regulovaný tok pod vodním dílem Vír.",
+        "model_key": None,
+    },
 ]
 
 
@@ -123,6 +164,20 @@ def prepare_station_options(df: pd.DataFrame) -> pd.DataFrame:
     out = out[out["station_name"].astype(str).str.len() > 0].copy()
     out = out.sort_values(["stream_name", "station_name", "station_id"]).reset_index(drop=True)
     return out
+
+
+def get_station_row_by_id(df_meta: pd.DataFrame, station_id: str) -> pd.Series:
+    sub = df_meta[df_meta["station_id"] == station_id]
+    if sub.empty:
+        raise ValueError(f"Stanice {station_id} nebyla nalezena v katalogu.")
+    return sub.iloc[0]
+
+
+def get_recommended_pair_by_label(label: str) -> dict:
+    for pair in RECOMMENDED_PAIRS:
+        if pair["label"] == label:
+            return pair
+    raise ValueError(f"Doporučená dvojice '{label}' nebyla nalezena.")
 
 
 @st.cache_data(ttl=24 * 3600)
@@ -235,6 +290,10 @@ def build_dual_station_features(df1: pd.DataFrame, df2: pd.DataFrame, label1: st
 
     df[f"dH_{label1}_1h"] = df[f"H_{label1}"] - df[f"H_{label1}"].shift(6)
     df[f"dH_{label2}_1h"] = df[f"H_{label2}"] - df[f"H_{label2}"].shift(6)
+    df[f"dH_{label1}_2h"] = df[f"H_{label1}"] - df[f"H_{label1}"].shift(12)
+    df[f"dH_{label2}_2h"] = df[f"H_{label2}"] - df[f"H_{label2}"].shift(12)
+    df[f"rolling_{label1}_3h"] = df[f"dH_{label1}_1h"].rolling(18, min_periods=6).mean()
+    df[f"rolling_{label2}_3h"] = df[f"dH_{label2}_1h"].rolling(18, min_periods=6).mean()
     df["delta_H_2minus1"] = df[f"H_{label2}"] - df[f"H_{label1}"]
     return df
 
@@ -303,7 +362,6 @@ def kayak_decision_layer(H_nesmer: float, proba: float) -> dict:
 
 
 def evaluate_oslava_nowcast(df_dual: pd.DataFrame, model: dict) -> dict:
-    # mapování do původních názvů features pro Mostiště/Nesměř
     df = pd.DataFrame(index=df_dual.index)
     df["H_mostiste"] = df_dual["H_upstream"]
     df["H_nesmer"] = df_dual["H_downstream"]
@@ -338,10 +396,6 @@ def evaluate_oslava_nowcast(df_dual: pd.DataFrame, model: dict) -> dict:
 # ANALYTIKA
 # =========================================================
 def estimate_lag_correlation(df: pd.DataFrame, up_col: str, down_col: str, max_lag_h: int = 6) -> pd.DataFrame:
-    """
-    Jednoduchá lag korelace pro 10min data.
-    max_lag_h=6 znamená test zpoždění 0..6 hodin.
-    """
     rows = []
     for lag_steps in range(0, max_lag_h * 6 + 1):
         corr = df[up_col].corr(df[down_col].shift(-lag_steps))
@@ -350,8 +404,62 @@ def estimate_lag_correlation(df: pd.DataFrame, up_col: str, down_col: str, max_l
             "lag_hours": lag_steps / 6,
             "corr": corr,
         })
-    out = pd.DataFrame(rows)
-    return out
+    return pd.DataFrame(rows)
+
+
+def train_experimental_pair_model(df_dual: pd.DataFrame, forecast_h: int = 2, rise_thr_cm: float = 2.0) -> dict:
+    """
+    Experimentální MVP model:
+    target = zda downstream za +forecast_h hodin vzroste o alespoň rise_thr_cm.
+    Vstupy = upstream H a změny.
+    Trénuje se nad dostupnou časovou řadou v df_dual.
+    """
+    df = df_dual.copy()
+
+    steps = forecast_h * 6  # 10min data
+    df["target_rise"] = ((df["H_downstream"].shift(-steps) - df["H_downstream"]) >= rise_thr_cm).astype(float)
+
+    features = [
+        "H_upstream",
+        "dH_upstream_1h",
+        "dH_upstream_2h",
+        "rolling_upstream_3h",
+    ]
+
+    model_df = df.dropna(subset=features + ["target_rise"]).copy()
+
+    if len(model_df) < 50:
+        raise ValueError(f"Pro experimentální trénink je zatím málo vzorků: {len(model_df)}")
+
+    if model_df["target_rise"].nunique() < 2:
+        raise ValueError("Target nemá obě třídy. Zkus změnit rise_thr_cm nebo forecast_h.")
+
+    split_idx = int(len(model_df) * 0.75)
+    X_train = model_df[features].iloc[:split_idx]
+    X_test = model_df[features].iloc[split_idx:]
+    y_train = model_df["target_rise"].iloc[:split_idx]
+    y_test = model_df["target_rise"].iloc[split_idx:]
+
+    clf = LogisticRegression(max_iter=2000)
+    clf.fit(X_train, y_train)
+
+    test_proba = clf.predict_proba(X_test)[:, 1]
+    auc = roc_auc_score(y_test, test_proba)
+
+    return {
+        "model_type": "rise_prediction_experimental",
+        "forecast_h": forecast_h,
+        "rise_threshold_cm": rise_thr_cm,
+        "features": features,
+        "intercept": float(clf.intercept_[0]),
+        "coefficients": {f: float(c) for f, c in zip(features, clf.coef_[0])},
+        "auc_test": float(auc),
+        "n_samples": int(len(model_df)),
+        "class_balance": {
+            "0": int((model_df["target_rise"] == 0).sum()),
+            "1": int((model_df["target_rise"] == 1).sum()),
+        },
+    }
 
 
 # =========================================================
@@ -359,6 +467,7 @@ def estimate_lag_correlation(df: pd.DataFrame, up_col: str, down_col: str, max_l
 # =========================================================
 st.title("🌊 Hydro multiprofile dashboard")
 st.caption("Výběr 1 nebo 2 hlásných profilů z aktuálního katalogu ČHMÚ. Pro Oslavu Mostiště → Nesměř se použije i kajak/model logika.")
+st.info("Dashboard podporuje dva režimy: doporučené hydrologicky smysluplné dvojice a vlastní experimentální výběr profilů.")
 
 df_meta, meta_source = get_station_catalog()
 
@@ -366,35 +475,75 @@ with st.sidebar:
     st.header("Výběr profilů")
     st.caption(f"Katalog stanic: {meta_source}")
 
-    rivers = sorted(df_meta["stream_name"].dropna().unique().tolist())
-    selected_river = st.selectbox("Řeka / tok", rivers)
+    selection_mode = st.radio(
+        "Režim výběru",
+        ["Doporučené dvojice", "Vlastní výběr"],
+        index=0,
+    )
 
-    river_df = df_meta[df_meta["stream_name"] == selected_river].copy()
+    station1_row = None
+    station2_row = None
+    station1_id = None
+    station2_id = None
+    selected_pair = None
 
-    station1_label = st.selectbox("První hlásný profil", river_df["label"].tolist(), index=0)
-    station2_options = ["(jen jeden profil)"] + river_df["label"].tolist()
-    station2_label = st.selectbox("Druhý hlásný profil", station2_options, index=0)
+    if selection_mode == "Doporučené dvojice":
+        pair_labels = [p["label"] for p in RECOMMENDED_PAIRS]
+        selected_pair_label = st.selectbox("Doporučená dvojice", pair_labels, index=0)
 
-    station1_row = river_df[river_df["label"] == station1_label].iloc[0]
-    station1_id = station1_row["station_id"]
+        selected_pair = get_recommended_pair_by_label(selected_pair_label)
 
-    if station2_label == "(jen jeden profil)":
-        station2_id = None
-        station2_row = None
-    else:
-        station2_row = river_df[river_df["label"] == station2_label].iloc[0]
+        station1_row = get_station_row_by_id(df_meta, selected_pair["upstream_id"])
+        station2_row = get_station_row_by_id(df_meta, selected_pair["downstream_id"])
+
+        station1_id = station1_row["station_id"]
         station2_id = station2_row["station_id"]
 
-    st.divider()
-    st.write("**Profil 1:**", station1_row["station_name"])
-    st.write("**ID 1:**", station1_id)
-    if station2_row is not None:
-        st.write("**Profil 2:**", station2_row["station_name"])
-        st.write("**ID 2:**", station2_id)
+        st.write("**Řeka:**", selected_pair["stream_name"])
+        st.write("**Popis:**", selected_pair["description"])
+        st.write("**Profil 1 (upstream):**", station1_row["station_name"])
+        st.write("**Profil 2 (downstream):**", station2_row["station_name"])
 
-    auto_refresh = st.toggle("Auto refresh přes cache TTL", value=True)
+    else:
+        rivers = sorted(df_meta["stream_name"].dropna().unique().tolist())
+        selected_river = st.selectbox("Řeka / tok", rivers)
+
+        river_df = df_meta[df_meta["stream_name"] == selected_river].copy()
+
+        station1_label = st.selectbox("První hlásný profil", river_df["label"].tolist(), index=0)
+        station2_options = ["(jen jeden profil)"] + river_df["label"].tolist()
+        station2_label = st.selectbox("Druhý hlásný profil", station2_options, index=0)
+
+        station1_row = river_df[river_df["label"] == station1_label].iloc[0]
+        station1_id = station1_row["station_id"]
+
+        if station2_label == "(jen jeden profil)":
+            station2_id = None
+            station2_row = None
+        else:
+            station2_row = river_df[river_df["label"] == station2_label].iloc[0]
+            station2_id = station2_row["station_id"]
+
+        st.write("**Profil 1:**", station1_row["station_name"])
+        st.write("**ID 1:**", station1_id)
+        if station2_row is not None:
+            st.write("**Profil 2:**", station2_row["station_name"])
+            st.write("**ID 2:**", station2_id)
+
+    with st.expander("Souřadnice profilů"):
+        st.write(
+            f"Profil 1: {station1_row['station_name']} | lat={station1_row['lat']}, lon={station1_row['lon']}"
+        )
+        if station2_row is not None:
+            st.write(
+                f"Profil 2: {station2_row['station_name']} | lat={station2_row['lat']}, lon={station2_row['lon']}"
+            )
 
 try:
+    if station2_id is not None and station1_id == station2_id:
+        st.error("Profil 1 a profil 2 nesmí být stejná stanice.")
+        st.stop()
+
     # -----------------------------------------------------
     # SINGLE PROFILE
     # -----------------------------------------------------
@@ -454,8 +603,11 @@ try:
             delta_h = float(last_dual["delta_H_2minus1"]) if pd.notna(last_dual.get("delta_H_2minus1")) else float("nan")
             st.metric("H2 - H1", f"{delta_h:.1f} cm")
 
-        # Oslava speciální logika: Mostiště -> Nesměř
-        is_oslava_pair = (
+        selected_model_key = None
+        if selection_mode == "Doporučené dvojice" and selected_pair is not None:
+            selected_model_key = selected_pair.get("model_key")
+
+        is_oslava_pair = selected_model_key == "oslava_rise_tplus2h" or (
             station1_id == "0-203-1-471000" and station2_id == "0-203-1-473000"
         )
 
@@ -521,10 +673,61 @@ try:
                 "H_upstream", "Q_upstream",
                 "H_downstream", "Q_downstream",
                 "dH_upstream_1h", "dH_downstream_1h",
+                "dH_upstream_2h", "dH_downstream_2h",
+                "rolling_upstream_3h", "rolling_downstream_3h",
                 "delta_H_2minus1",
             ]
             show_cols = [c for c in show_cols if c in df_dual.columns]
             st.dataframe(df_dual[show_cols].tail(30), width="stretch")
+
+        st.divider()
+        st.subheader("Experimentální trénink vlastního modelu")
+        st.caption("Tahle verze je MVP. Trénuje jednoduchý logistický model nad dostupnou časovou řadou v dashboardu. Pro plnohodnotný model je vhodné napojit historická data.")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            forecast_h = st.number_input("Forecast horizon [h]", min_value=1, max_value=12, value=2, step=1)
+        with col_b:
+            rise_thr_cm = st.number_input("Target rise threshold [cm]", min_value=0.5, max_value=20.0, value=2.0, step=0.5)
+
+        train_model = st.button("Natrénovat model pro zvolenou dvojici")
+
+        if train_model:
+            try:
+                trained_model = train_experimental_pair_model(
+                    df_dual=df_dual,
+                    forecast_h=int(forecast_h),
+                    rise_thr_cm=float(rise_thr_cm),
+                )
+
+                st.success("Experimentální model byl natrénován.")
+                st.write(f"**Počet vzorků:** {trained_model['n_samples']}")
+                st.write(f"**AUC test:** {trained_model['auc_test']:.3f}")
+
+                coef_df = pd.Series(trained_model["coefficients"]).to_frame("coef")
+                st.dataframe(coef_df, width="stretch")
+
+                model_export = {
+                    **trained_model,
+                    "upstream_id": station1_id,
+                    "downstream_id": station2_id,
+                    "upstream_name": station1_row["station_name"],
+                    "downstream_name": station2_row["station_name"],
+                    "stream_name": station1_row["stream_name"],
+                }
+
+                st.download_button(
+                    "Stáhnout model JSON",
+                    data=json.dumps(model_export, ensure_ascii=False, indent=2),
+                    file_name=f"model_{station1_id}_{station2_id}_tplus{forecast_h}h.json",
+                    mime="application/json",
+                )
+
+                with st.expander("Model JSON preview"):
+                    st.json(model_export)
+
+            except Exception as e:
+                st.error(f"Trénink modelu selhal: {e}")
 
 except Exception as e:
     st.error(f"Dashboardu se nepodařilo načíst data: {e}")
