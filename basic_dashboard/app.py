@@ -39,6 +39,11 @@ STATE_PATHS = [
     Path("../alert_state.json"),
 ]
 
+HISTORY_PATHS = [
+    Path("alert_history.csv"),
+    Path("../alert_history.csv"),
+]
+
 
 def load_model_json(path: Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -71,6 +76,13 @@ def find_state_file() -> Path | None:
     return None
 
 
+def find_history_file() -> Path | None:
+    for path in HISTORY_PATHS:
+        if path.exists():
+            return path
+    return None
+
+
 def load_alert_state() -> dict:
     state_path = find_state_file()
     if state_path is None:
@@ -86,6 +98,26 @@ def load_alert_state() -> dict:
 
     state["state_source"] = str(state_path)
     return state
+
+
+def load_alert_history() -> pd.DataFrame:
+    history_path = find_history_file()
+    if history_path is None:
+        return pd.DataFrame(
+            columns=[
+                "time", "alert_level", "kayak_decision", "eta", "proba",
+                "H_mostiste", "H_nesmer",
+                "dH_mostiste_1h", "dH_mostiste_2h", "rolling_dH_3h",
+                "email_sent", "anti_spam_reason"
+            ]
+        )
+
+    df_hist = pd.read_csv(history_path)
+    if "time" in df_hist.columns:
+        df_hist["time"] = pd.to_datetime(df_hist["time"], errors="coerce")
+        df_hist = df_hist.sort_values("time")
+
+    return df_hist
 
 
 def parse_chmi_dt(series, local_tz: str = LOCAL_TZ):
@@ -183,7 +215,6 @@ def build_live_features() -> pd.DataFrame:
     out["Q_mostiste"] = pd.to_numeric(out.get("Q_mostiste_live"), errors="coerce")
     out["Q_nesmer"] = pd.to_numeric(out.get("Q_nesmer_live"), errors="coerce")
 
-    # 10min data
     out["dH_mostiste_1h"] = out["H_mostiste"] - out["H_mostiste"].shift(6)
     out["dH_mostiste_2h"] = out["H_mostiste"] - out["H_mostiste"].shift(12)
     out["rolling_dH_3h"] = out["dH_mostiste_1h"].rolling(18, min_periods=6).mean()
@@ -373,6 +404,7 @@ try:
     live_features = build_live_features()
     result = evaluate_nowcast(live_features, model)
     alert_state = load_alert_state()
+    alert_history = load_alert_history()
 
     c1, c2, c3 = st.columns([1.7, 1, 1])
     with c1:
@@ -414,6 +446,46 @@ try:
 
     with st.expander("Detail alert state"):
         st.json(alert_state)
+
+    st.divider()
+    st.subheader("Historie alertů")
+
+    if alert_history.empty:
+        st.info("Historie alertů zatím není k dispozici.")
+    else:
+        hist_recent = alert_history.dropna(subset=["time"]).copy()
+
+        cutoff_hist = hist_recent["time"].max() - pd.Timedelta("7D")
+        hist_recent = hist_recent.loc[hist_recent["time"] >= cutoff_hist].copy()
+
+        h1, h2, h3 = st.columns(3)
+        with h1:
+            st.metric("Záznamů (7 dní)", len(hist_recent))
+        with h2:
+            st.metric("Email sent count", int(hist_recent["email_sent"].fillna(0).sum()))
+        with h3:
+            st.metric("ALERT count", int((hist_recent["alert_level"] == "ALERT").sum()))
+
+        st.write("### Pravděpodobnost v čase")
+        chart_df = hist_recent.set_index("time")[["proba"]].copy()
+        st.line_chart(chart_df)
+
+        st.write("### Poslední alerty")
+        show_cols = [
+            "time",
+            "alert_level",
+            "kayak_decision",
+            "eta",
+            "proba",
+            "H_mostiste",
+            "H_nesmer",
+            "email_sent",
+            "anti_spam_reason",
+        ]
+        st.dataframe(
+            hist_recent[show_cols].sort_values("time", ascending=False).head(50),
+            width="stretch",
+        )
 
     st.divider()
 

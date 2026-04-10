@@ -20,6 +20,7 @@ STATIONS = {
 
 MODEL_PATH = Path("basic_dashboard/oslava_model_rise_tplus2h.json")
 STATE_PATH = Path("alert_state.json")
+HISTORY_PATH = Path("alert_history.csv")
 
 
 def env_float(name: str, default: float) -> float:
@@ -252,22 +253,48 @@ def should_send_alert(result: dict, state: dict) -> tuple[bool, str]:
     if current_level == "NO_ALERT":
         return False, "no alert state"
 
-    # 1) změna úrovně
     if current_level != prev_level:
         return True, f"level change {prev_level} -> {current_level}"
 
-    # 2) velký skok pravděpodobnosti
     if abs(current_proba - prev_proba) >= proba_jump:
         return True, f"probability jump {prev_proba:.2f} -> {current_proba:.2f}"
 
-    # 3) cooldown
     if hours_since(last_sent_at) >= cooldown_h:
         return True, f"cooldown passed ({cooldown_h} h)"
 
     return False, "suppressed by anti-spam"
 
 
-def commit_state_file() -> None:
+def append_history_row(result: dict, email_sent: bool, anti_spam_reason: str) -> None:
+    row = {
+        "time": result["time"],
+        "alert_level": result["alert_level"],
+        "kayak_decision": result["kayak_decision"],
+        "eta": result["eta"],
+        "proba": result["proba"],
+        "H_mostiste": result["H_mostiste"],
+        "H_nesmer": result["H_nesmer"],
+        "dH_mostiste_1h": result["dH_mostiste_1h"],
+        "dH_mostiste_2h": result["dH_mostiste_2h"],
+        "rolling_dH_3h": result["rolling_dH_3h"],
+        "email_sent": int(email_sent),
+        "anti_spam_reason": anti_spam_reason,
+    }
+
+    df_row = pd.DataFrame([row])
+
+    if HISTORY_PATH.exists():
+        df_old = pd.read_csv(HISTORY_PATH)
+        df_all = pd.concat([df_old, df_row], ignore_index=True)
+    else:
+        df_all = df_row
+
+    df_all = df_all.drop_duplicates(subset=["time"], keep="last")
+    df_all = df_all.sort_values("time").tail(5000)
+    df_all.to_csv(HISTORY_PATH, index=False)
+
+
+def commit_runtime_files() -> None:
     if os.getenv("GITHUB_ACTIONS") != "true":
         return
 
@@ -277,18 +304,15 @@ def commit_state_file() -> None:
         check=True,
     )
 
-    subprocess.run(["git", "add", str(STATE_PATH)], check=True)
+    subprocess.run(["git", "add", str(STATE_PATH), str(HISTORY_PATH)], check=True)
 
-    diff_check = subprocess.run(
-        ["git", "diff", "--cached", "--quiet"],
-        check=False,
-    )
+    diff_check = subprocess.run(["git", "diff", "--cached", "--quiet"], check=False)
 
     if diff_check.returncode == 0:
-        print("No state changes to commit.")
+        print("No state/history changes to commit.")
         return
 
-    subprocess.run(["git", "commit", "-m", "Update alert state [skip ci]"], check=True)
+    subprocess.run(["git", "commit", "-m", "Update alert state/history [skip ci]"], check=True)
     subprocess.run(["git", "push"], check=True)
 
 
@@ -353,11 +377,14 @@ Anti-spam:
 {send_reason}
 """
 
+    email_sent = False
+
     if send_it:
         subject = f"Oslava {result['alert_level']} – {result['kayak_decision']}"
         send_email(subject, body)
         print("Email sent.")
         state["last_sent_at"] = utc_now_iso()
+        email_sent = True
     else:
         print("No email sent.")
 
@@ -365,7 +392,8 @@ Anti-spam:
     state["last_proba"] = float(result["proba"])
 
     save_state(state)
-    commit_state_file()
+    append_history_row(result, email_sent=email_sent, anti_spam_reason=send_reason)
+    commit_runtime_files()
 
 
 if __name__ == "__main__":
