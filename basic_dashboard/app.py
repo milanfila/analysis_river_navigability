@@ -7,6 +7,7 @@ from typing import Optional
 
 import matplotlib.pyplot as plt
 import pandas as pd
+import pydeck as pdk
 import requests
 import streamlit as st
 from sklearn.linear_model import LogisticRegression
@@ -235,6 +236,82 @@ def get_station_catalog() -> tuple[pd.DataFrame, str]:
     df_meta, source = load_station_catalog()
     df_meta = prepare_station_options(df_meta)
     return df_meta, source
+
+
+def render_station_overview_map(
+    df_meta: pd.DataFrame,
+    stream_name: str,
+    selected_station_ids: list[str] | None = None,
+):
+    if selected_station_ids is None:
+        selected_station_ids = []
+
+    map_df = df_meta[df_meta["stream_name"] == stream_name].copy()
+    map_df = map_df.dropna(subset=["lat", "lon"]).copy()
+
+    if map_df.empty:
+        st.info("Pro tuto řeku nejsou k dispozici souřadnice stanic.")
+        return
+
+    map_df["is_selected"] = map_df["station_id"].isin(selected_station_ids)
+    map_df["radius"] = map_df["is_selected"].map({True: 900, False: 450})
+    map_df["label_text"] = map_df["station_name"].astype(str)
+
+    map_df["color"] = map_df["is_selected"].apply(
+        lambda x: [220, 50, 47, 220] if x else [70, 130, 180, 140]
+    )
+
+    center_lat = float(map_df["lat"].mean())
+    center_lon = float(map_df["lon"].mean())
+
+    scatter = pdk.Layer(
+        "ScatterplotLayer",
+        data=map_df,
+        get_position="[lon, lat]",
+        get_radius="radius",
+        get_fill_color="color",
+        pickable=True,
+    )
+
+    text = pdk.Layer(
+        "TextLayer",
+        data=map_df,
+        get_position="[lon, lat]",
+        get_text="label_text",
+        get_size=14,
+        get_color=[20, 20, 20, 220],
+        get_angle=0,
+        get_text_anchor="'start'",
+        get_alignment_baseline="'center'",
+        get_pixel_offset=[12, 0],
+        pickable=False,
+    )
+
+    tooltip = {
+        "html": "<b>{station_name}</b><br/>{stream_name}<br/>{station_id}",
+        "style": {"backgroundColor": "steelblue", "color": "white"},
+    }
+
+    deck = pdk.Deck(
+        map_style="mapbox://styles/mapbox/light-v9",
+        initial_view_state=pdk.ViewState(
+            latitude=center_lat,
+            longitude=center_lon,
+            zoom=9,
+            pitch=0,
+        ),
+        layers=[scatter, text],
+        tooltip=tooltip,
+    )
+
+    st.pydeck_chart(deck, use_container_width=True)
+
+    with st.expander("Seznam stanic na vybrané řece"):
+        show_cols = ["station_name", "station_id", "lat", "lon"]
+        st.dataframe(
+            map_df[show_cols].sort_values("station_name").reset_index(drop=True),
+            width="stretch",
+        )
 
 
 # =========================================================
@@ -493,9 +570,6 @@ def predict_proba(last_row: pd.Series, model: dict) -> float:
 
 
 def predict_proba_series(df_dual: pd.DataFrame, model: dict) -> pd.DataFrame:
-    """
-    Retrospektivní proba série nad live dual dataframe.
-    """
     df = pd.DataFrame(index=df_dual.index)
     df["H_upstream"] = df_dual["H_upstream"]
     df["H_downstream"] = df_dual["H_downstream"]
@@ -743,6 +817,14 @@ with st.sidebar:
         st.write("**Profil 1 (upstream):**", station1_row["station_name"])
         st.write("**Profil 2 (downstream):**", station2_row["station_name"])
 
+        st.divider()
+        st.caption("Orientační mapa všech stanic na vybrané řece")
+        render_station_overview_map(
+            df_meta=df_meta,
+            stream_name=selected_pair["stream_name"],
+            selected_station_ids=[station1_id, station2_id],
+        )
+
     else:
         rivers = sorted(df_meta["stream_name"].dropna().unique().tolist())
         selected_river = st.selectbox("Řeka / tok", rivers)
@@ -770,6 +852,18 @@ with st.sidebar:
         if station2_row is not None:
             st.write("**Profil 2:**", station2_row["station_name"])
             st.write("**ID 2:**", station2_id)
+
+        st.divider()
+        st.caption("Orientační mapa všech stanic na vybrané řece")
+        selected_ids = [station1_id]
+        if station2_id is not None:
+            selected_ids.append(station2_id)
+
+        render_station_overview_map(
+            df_meta=df_meta,
+            stream_name=selected_river,
+            selected_station_ids=selected_ids,
+        )
 
     with st.expander("Souřadnice profilů"):
         st.write(
@@ -998,9 +1092,42 @@ try:
         st.line_chart(df_dual.loc[df_dual.index >= cutoff, ["delta_H_2minus1"]])
 
         st.subheader("Krátkodobé změny")
-        trend_cols = [c for c in ["dH_upstream_1h", "dH_downstream_1h", "rolling_upstream_3h"] if c in df_dual.columns]
-        if trend_cols:
-            st.line_chart(df_dual.loc[df_dual.index >= cutoff, trend_cols])
+        plot_df = df_dual.loc[df_dual.index >= cutoff].copy()
+
+        fig_trend, ax_trend = plt.subplots(figsize=(10, 4))
+
+        if "dH_upstream_1h" in plot_df.columns:
+            ax_trend.plot(
+                plot_df.index,
+                plot_df["dH_upstream_1h"],
+                label="dH_upstream_1h",
+                linewidth=1.8,
+            )
+
+        if "dH_downstream_1h" in plot_df.columns:
+            ax_trend.plot(
+                plot_df.index,
+                plot_df["dH_downstream_1h"],
+                label="dH_downstream_1h",
+                linewidth=1.8,
+            )
+
+        if "rolling_upstream_3h" in plot_df.columns:
+            ax_trend.plot(
+                plot_df.index,
+                plot_df["rolling_upstream_3h"],
+                label="rolling_upstream_3h",
+                color="red",
+                linewidth=2.2,
+            )
+
+        ax_trend.set_title("Krátkodobé změny")
+        ax_trend.set_ylabel("cm")
+        ax_trend.set_xlabel("Time")
+        ax_trend.grid(True, alpha=0.3)
+        ax_trend.legend()
+
+        st.pyplot(fig_trend)
 
         st.subheader("Lag korelace")
         lag_df = estimate_lag_correlation(df_dual, "H_upstream", "H_downstream", max_lag_h=6)

@@ -3,3 +3,4 @@ pandas
 requests
 matplotlib
 scikit-learn
+pydeck
