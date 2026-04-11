@@ -293,7 +293,7 @@ def render_station_overview_map(
     }
 
     deck = pdk.Deck(
-        map_style="mapbox://styles/mapbox/light-v9",
+        map_style="light",
         initial_view_state=pdk.ViewState(
             latitude=center_lat,
             longitude=center_lon,
