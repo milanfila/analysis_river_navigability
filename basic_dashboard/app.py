@@ -421,7 +421,7 @@ def build_historical_dual_features(df1_hist: pd.DataFrame, df2_hist: pd.DataFram
 
 
 # =========================================================
-# MODELY - LOAD / SAVE / EVAL
+# MODELY
 # =========================================================
 def ensure_models_dir() -> Path:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -490,6 +490,37 @@ def predict_proba(last_row: pd.Series, model: dict) -> float:
                 z += float(coef) * float(last_row[f])
 
     return sigmoid(z)
+
+
+def predict_proba_series(df_dual: pd.DataFrame, model: dict) -> pd.DataFrame:
+    """
+    Retrospektivní proba série nad live dual dataframe.
+    """
+    df = pd.DataFrame(index=df_dual.index)
+    df["H_upstream"] = df_dual["H_upstream"]
+    df["H_downstream"] = df_dual["H_downstream"]
+    df["Q_upstream"] = df_dual.get("Q_upstream")
+    df["dH_upstream_1h"] = df_dual["dH_upstream_1h"]
+    df["dH_upstream_2h"] = df_dual["dH_upstream_2h"]
+    df["rolling_upstream_3h"] = df_dual["rolling_upstream_3h"]
+
+    required = list(set(model.get("features", [])))
+    out = df.copy()
+    out["proba"] = float("nan")
+
+    if not required:
+        return out[["proba"]]
+
+    valid = out.dropna(subset=required).copy()
+    if valid.empty:
+        return out[["proba"]]
+
+    probs = []
+    for _, row in valid.iterrows():
+        probs.append(predict_proba(row, model))
+
+    out.loc[valid.index, "proba"] = probs
+    return out[["proba"]]
 
 
 def kayak_decision_layer(H_nesmer: float, proba: float) -> dict:
@@ -630,6 +661,7 @@ def train_pair_model_from_history(
         "intercept": float(clf.intercept_[0]),
         "coefficients": {f: float(c) for f, c in zip(features, clf.coef_[0])},
         "threshold": 0.5,
+        "watch_threshold": 0.2,
         "auc_test": float(auc),
         "n_samples": int(len(model_df)),
         "class_balance": {
@@ -914,6 +946,53 @@ try:
 
         st.subheader("Posledních 48 hodin – hladiny")
         st.line_chart(df_dual.loc[df_dual.index >= cutoff, ["H_upstream", "H_downstream"]])
+
+        if auto_pair_model is not None:
+            st.subheader("Predikce modelu v čase")
+            proba_df = predict_proba_series(df_dual, auto_pair_model)
+            proba_recent = proba_df.loc[proba_df.index >= cutoff].copy()
+
+            fig_pred, ax_pred = plt.subplots(figsize=(10, 4))
+            ax_pred.plot(proba_recent.index, proba_recent["proba"], label="P(rise)", linewidth=2)
+
+            watch_thr = float(auto_pair_model.get("watch_threshold", 0.2))
+            alert_thr = float(auto_pair_model.get("threshold", 0.5))
+
+            ax_pred.axhline(watch_thr, linestyle="--", linewidth=1, label=f"watch ({watch_thr:.2f})")
+            ax_pred.axhline(alert_thr, linestyle="--", linewidth=1, label=f"alert ({alert_thr:.2f})")
+
+            ax_pred.set_ylim(0, 1)
+            ax_pred.set_ylabel("Probability")
+            ax_pred.set_xlabel("Time")
+            ax_pred.set_title("Retrospektivní predikce modelu")
+            ax_pred.grid(True, alpha=0.3)
+            ax_pred.legend()
+            st.pyplot(fig_pred)
+
+            st.subheader("Hladiny a predikce dohromady")
+            combo = df_dual.join(proba_df, how="left")
+            combo_recent = combo.loc[combo.index >= cutoff].copy()
+
+            fig_combo, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+
+            ax1.plot(combo_recent.index, combo_recent["H_upstream"], label="H upstream")
+            ax1.plot(combo_recent.index, combo_recent["H_downstream"], label="H downstream")
+            ax1.set_ylabel("H [cm]")
+            ax1.set_title("Hladiny")
+            ax1.grid(True, alpha=0.3)
+            ax1.legend()
+
+            ax2.plot(combo_recent.index, combo_recent["proba"], label="P(rise)", linewidth=2)
+            ax2.axhline(watch_thr, linestyle="--", linewidth=1, label=f"watch ({watch_thr:.2f})")
+            ax2.axhline(alert_thr, linestyle="--", linewidth=1, label=f"alert ({alert_thr:.2f})")
+            ax2.set_ylim(0, 1)
+            ax2.set_ylabel("Probability")
+            ax2.set_xlabel("Time")
+            ax2.set_title("Predikce")
+            ax2.grid(True, alpha=0.3)
+            ax2.legend()
+
+            st.pyplot(fig_combo)
 
         st.subheader("Rozdíl hladin")
         st.line_chart(df_dual.loc[df_dual.index >= cutoff, ["delta_H_2minus1"]])
