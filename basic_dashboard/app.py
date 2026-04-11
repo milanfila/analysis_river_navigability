@@ -998,50 +998,9 @@ try:
         st.line_chart(df_dual.loc[df_dual.index >= cutoff, ["delta_H_2minus1"]])
 
         st.subheader("Krátkodobé změny")
-
-        plot_df = df_dual.loc[df_dual.index >= cutoff].copy()
-
-        fig_trend, ax_trend = plt.subplots(figsize=(10, 4))
-
-        if "dH_upstream_1h" in plot_df.columns:
-            ax_trend.plot(
-                plot_df.index,
-                plot_df["dH_upstream_1h"],
-                label="dH_upstream_1h",
-                linewidth=1.8,
-            )
-
-        if "dH_downstream_1h" in plot_df.columns:
-            ax_trend.plot(
-                plot_df.index,
-                plot_df["dH_downstream_1h"],
-                label="dH_downstream_1h",
-                linewidth=1.8,
-            )
-
-        if "rolling_upstream_3h" in plot_df.columns:
-            ax_trend.plot(
-                plot_df.index,
-                plot_df["rolling_upstream_3h"],
-                label="rolling_upstream_3h",
-                color="red",
-                linewidth=2.2,
-            )
-
-        ax_trend.set_title("Krátkodobé změny")
-        ax_trend.set_ylabel("cm")
-        ax_trend.set_xlabel("Time")
-        ax_trend.grid(True, alpha=0.3)
-        ax_trend.legend()
-
-        st.pyplot(fig_trend)
-
-        st.subheader("Lag korelace")
-        lag_df = estimate_lag_correlation(df_dual, "H_upstream", "H_downstream", max_lag_h=6)
-        best_row = lag_df.loc[lag_df["corr"].idxmax()] if lag_df["corr"].notna().any() else None
-
-        if best_row is not None:
-            st.write(f"**Max korelace:** {best_row['corr']:.3f} při lagu ≈ {best_row['lag_hours']:.2f} h")
+        trend_cols = [c for c in ["dH_upstream_1h", "dH_downstream_1h", "rolling_upstream_3h"] if c in df_dual.columns]
+        if trend_cols:
+            st.line_chart(df_dual.loc[df_dual.index >= cutoff, trend_cols])
 
         st.subheader("Lag korelace")
         lag_df = estimate_lag_correlation(df_dual, "H_upstream", "H_downstream", max_lag_h=6)
