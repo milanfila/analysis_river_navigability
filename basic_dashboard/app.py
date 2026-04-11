@@ -874,6 +874,39 @@ with st.sidebar:
                 f"Profil 2: {station2_row['station_name']} | lat={station2_row['lat']}, lon={station2_row['lon']}"
             )
 
+    st.divider()
+    st.caption("Mapa vybraného profilu / profilů")
+    if station2_row is None:
+        selected_map_df = pd.DataFrame(
+            [
+                {
+                    "station_name": station1_row["station_name"],
+                    "latitude": station1_row["lat"],
+                    "longitude": station1_row["lon"],
+                }
+            ]
+        )
+    else:
+        selected_map_df = pd.DataFrame(
+            [
+                {
+                    "role": "upstream",
+                    "station_name": station1_row["station_name"],
+                    "latitude": station1_row["lat"],
+                    "longitude": station1_row["lon"],
+                },
+                {
+                    "role": "downstream",
+                    "station_name": station2_row["station_name"],
+                    "latitude": station2_row["lat"],
+                    "longitude": station2_row["lon"],
+                },
+            ]
+        )
+
+    st.map(selected_map_df[["latitude", "longitude"]])
+    st.dataframe(selected_map_df, width="stretch")
+
 
 try:
     if station2_id is not None and station1_id == station2_id:
@@ -901,20 +934,6 @@ try:
             roll = safe_float(last["rolling_dH_3h"]) if pd.notna(last.get("rolling_dH_3h")) else float("nan")
             st.metric("dH / 1 h", f"{dh1:.1f} cm")
             st.metric("rolling dH / 3 h", f"{roll:.2f} cm")
-
-        st.divider()
-        st.subheader("Mapa stanice")
-        map_df = pd.DataFrame(
-            [
-                {
-                    "station_name": station1_row["station_name"],
-                    "latitude": station1_row["lat"],
-                    "longitude": station1_row["lon"],
-                }
-            ]
-        )
-        st.map(map_df)
-        st.dataframe(map_df, width="stretch")
 
         cutoff = feat1.index.max() - pd.Timedelta("48h")
         st.subheader("Posledních 48 hodin")
@@ -946,26 +965,6 @@ try:
         with c3:
             delta_h = safe_float(last_dual["delta_H_2minus1"]) if pd.notna(last_dual.get("delta_H_2minus1")) else float("nan")
             st.metric("H2 - H1", f"{delta_h:.1f} cm")
-
-        st.divider()
-        st.subheader("Mapa vybraných stanic")
-        map_rows = [
-            {
-                "role": "upstream",
-                "station_name": station1_row["station_name"],
-                "latitude": station1_row["lat"],
-                "longitude": station1_row["lon"],
-            },
-            {
-                "role": "downstream",
-                "station_name": station2_row["station_name"],
-                "latitude": station2_row["lat"],
-                "longitude": station2_row["lon"],
-            },
-        ]
-        map_df = pd.DataFrame(map_rows)
-        st.map(map_df[["latitude", "longitude"]])
-        st.dataframe(map_df, width="stretch")
 
         selected_model_key = None
         session_model_key = get_session_model_key(selected_pair_id)
