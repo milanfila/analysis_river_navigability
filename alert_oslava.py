@@ -191,7 +191,29 @@ def evaluate_alert(
     thresholds: Dict[str, float],
     model: Optional[Dict[str, object]] = None
 ) -> Dict[str, object]:
-    last = live_features.dropna(subset=["H_mostiste", "dH_mostiste_1h", "rolling_dH_3h"]).iloc[-1]
+    required_cols = ["H_mostiste", "dH_mostiste_1h", "rolling_dH_3h"]
+
+    valid = live_features.dropna(subset=required_cols)
+
+    if valid.empty:
+        return {
+            "time": str(live_features.index[-1]) if len(live_features) else None,
+            "H_mostiste": float("nan"),
+            "H_nesmer": float("nan"),
+            "Q_mostiste": float("nan"),
+            "dH_mostiste_1h": float("nan"),
+            "rolling_dH_3h": float("nan"),
+            "decision": "NO_ALERT",
+            "confidence": 0.0,
+            "proba_tplus_2h": None,
+            "reasons": [
+                "Nelze vyhodnotit alert: chybí platný řádek s H_mostiste, dH_mostiste_1h a rolling_dH_3h."
+            ],
+            "interpretation": "Aktuálně nejsou dostupná kompletní živá data pro vyhodnocení.",
+            "thresholds": thresholds,
+        }
+
+    last = valid.iloc[-1]
 
     H = float(last["H_mostiste"])
     Hn = float(last["H_nesmer"]) if pd.notna(last.get("H_nesmer")) else float("nan")
@@ -205,7 +227,6 @@ def evaluate_alert(
 
     reasons = []
 
-    # model-based decision
     if proba is not None:
         if proba >= 0.75:
             decision = "ALERT"
@@ -220,7 +241,6 @@ def evaluate_alert(
             confidence = proba
             reasons.append(f"model P(sjízdné za 2h) = {proba:.2f}")
 
-        # hard override při silné manipulaci
         if dH1 >= thresholds["dH_alert"]:
             decision = "ALERT"
             confidence = max(confidence, 0.9)
@@ -231,7 +251,6 @@ def evaluate_alert(
             reasons.append(f"hard watch trigger: dH_mostiste_1h = {dH1:.1f} cm")
 
     else:
-        # fallback čistě podle thresholdů
         if dH1 >= thresholds["dH_alert"] and (
             H >= thresholds["H_min_alert"] or
             trend3 >= thresholds["rolling_alert"] or
