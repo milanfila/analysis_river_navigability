@@ -1073,3 +1073,4 @@ time,alert_level,kayak_decision,eta,proba,H_mostiste,H_nesmer,dH_mostiste_1h,dH_
 2026-07-02 21:20:00+02:00,NO_ALERT,NEJEĎ,-,0.0627927517303949,25.0,66.0,0.0,0.0,0.0,0,no alert state
 2026-07-02 22:30:00+02:00,NO_ALERT,NEJEĎ,-,0.0627927517303949,25.0,66.0,0.0,0.0,0.0,0,no alert state
 2026-07-02 23:20:00+02:00,NO_ALERT,NEJEĎ,-,0.0627927517303949,25.0,67.0,0.0,0.0,0.0,0,no alert state
+2026-07-03 00:50:00+02:00,NO_ALERT,NEJEĎ,-,0.0627927517303949,25.0,66.0,0.0,0.0,0.0,0,no alert state
