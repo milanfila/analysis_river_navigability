@@ -2558,3 +2558,4 @@ time,alert_level,kayak_decision,eta,proba,H_mostiste,H_nesmer,dH_mostiste_1h,dH_
 2026-10-29 16:50:00+01:00,WATCH,SLEDUJ,2–3 h / nejisté,0.3872895306384488,24.0,73.0,0.0,0.0,0.9444444444444444,1,cooldown passed (6 h)
 2026-10-29 21:50:00+01:00,NO_ALERT,NEJEĎ,-,0.0627927517303949,24.0,73.0,0.0,0.0,0.0,0,no alert state
 2026-10-30 00:40:00+01:00,NO_ALERT,NEJEĎ,-,0.0627927517303949,24.0,75.0,0.0,0.0,0.0,0,no alert state
+2026-10-30 07:10:00+01:00,NO_ALERT,NEJEĎ,-,0.0627927517303949,24.0,73.0,0.0,0.0,0.0,0,no alert state
